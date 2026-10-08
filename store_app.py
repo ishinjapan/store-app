@@ -10,6 +10,17 @@ st.set_page_config(
     layout="centered"
 )
 
+# スマホ（iPhone等）表示時にタイトル見出しが大きすぎないようCSSで調整
+st.markdown("""
+    <style>
+    @media (max-width: 768px) {
+        h1 {
+            font-size: 1.6rem !important;
+        }
+    }
+    </style>
+""", unsafe_allow_html=True)
+
 DATA_DIR = os.path.abspath("./data")
 os.makedirs(DATA_DIR, exist_ok=True)
 DELIVERY_DATA_PATH = os.path.join(DATA_DIR, "delivery_sales.csv")
@@ -100,10 +111,10 @@ if st.session_state["logged_in_store"] is None:
 else:
     current_store = st.session_state["logged_in_store"]
     
-    col_top1, col_top2 = st.columns([4, 1])
+    col_top1, col_top2 = st.columns([3.5, 1.5])
     with col_top1:
-        st.title(f"📱 デリバリー売上 入力フォーム")
-        st.markdown(f"現在ログイン中の店舗: **{current_store}**")
+        st.title("📱 デリバリー売上入力")
+        st.markdown(f"ログイン中: **{current_store}**")
     with col_top2:
         st.write("###")
         if st.button("ログアウト", type="secondary"):
@@ -117,7 +128,7 @@ else:
     with col_s1:
         selected_date = st.date_input("対象日付", value=datetime.now().date()).strftime("%Y-%m-%d")
     with col_s2:
-        selected_slot = st.selectbox("時間帯を選択", TIME_SLOTS)
+        selected_slot = st.selectbox("時間帯", TIME_SLOTS)
     
     st.markdown("---")
     
@@ -144,37 +155,37 @@ else:
 
     col_d1, col_d2 = st.columns(2)
     with col_d1:
-        uber_val = st.number_input("Uber Eats 売上 (円)", min_value=0, value=default_uber, step=500)
-        rn_val = st.number_input("Rocket now 売上 (円)", min_value=0, value=default_rn, step=500)
+        uber_val = st.number_input("Uber Eats (円)", min_value=0, value=default_uber, step=500)
+        rn_val = st.number_input("Rocket now (円)", min_value=0, value=default_rn, step=500)
     with col_d2:
-        demaekan_val = st.number_input("出前館 売上 (円)", min_value=0, value=default_demae, step=500)
-        other_val = st.number_input("その他 売上 (円)", min_value=0, value=default_other, step=500)
+        demaekan_val = st.number_input("出前館 (円)", min_value=0, value=default_demae, step=500)
+        other_val = st.number_input("その他 (円)", min_value=0, value=default_other, step=500)
 
     st.markdown("---")
     total_delivery = uber_val + rn_val + demaekan_val + other_val
-    st.info(f"💡 この時間帯のデリバリー売上合計: **¥{total_delivery:,}**")
+    st.info(f"💡 合計売上: **¥{total_delivery:,}**")
 
     if not is_already_registered:
         if st.button("💾 デリバリー売上を保存する", type="primary"):
             save_delivery_data(selected_date, current_store, selected_slot, uber_val, rn_val, demaekan_val, other_val)
-            st.success(f"🎉 {current_store} ({selected_date} / {selected_slot}) のデリバリー売上を保存しました！")
+            st.success(f"🎉 {current_store} ({selected_date} / {selected_slot}) の売上を保存しました！")
             st.rerun()
     else:
         if not st.session_state["show_overwrite_auth"]:
-            if st.button("🔒 修正して上書き保存する（要パスワード）", type="primary"):
+            if st.button("🔒 修正して上書き保存（要パスワード）", type="primary"):
                 st.session_state["show_overwrite_auth"] = True
                 st.rerun()
         else:
             st.markdown("#### 🔐 管理者パスワード認証")
-            admin_pass_input = st.text_input("上書き用パスワードを入力してください", type="password", key="overwrite_pass_input")
+            admin_pass_input = st.text_input("上書き用パスワード", type="password", key="overwrite_pass_input")
             
             col_btn1, col_btn2 = st.columns(2)
             with col_btn1:
-                if st.button("✅ 認証して上書き実行", type="primary"):
+                if st.button("✅ 認証して上書き", type="primary"):
                     if admin_pass_input.strip() == OVERWRITE_ADMIN_PASS:
                         save_delivery_data(selected_date, current_store, selected_slot, uber_val, rn_val, demaekan_val, other_val)
                         st.session_state["show_overwrite_auth"] = False
-                        st.success(f"🎉 パスワード認証成功！ {current_store} のデータを上書き保存しました！")
+                        st.success(f"🎉 上書き保存しました！")
                         st.rerun()
                     else:
                         st.error("❌ パスワードが違います。")
