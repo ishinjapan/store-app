@@ -8,7 +8,7 @@ import glob
 import subprocess
 import io
 import uuid
-from streamlit_gsheets import GSheetsConnection # スプレッドシート用に追加
+from streamlit_gsheets import GSheetsConnection
 
 # openpyxlのスタイリング設定用モジュール
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -23,7 +23,7 @@ st.set_page_config(
 # スプレッドシートとの接続
 conn = st.connection("gsheets", type=GSheetsConnection)
 
-# Airレジからの取得データ(CSV)は一時的にローカル出力フォルダを使用
+# Airレジからの取得データ(CSV)用フォルダ
 OUTPUT_DIR = os.path.abspath("./output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -46,7 +46,6 @@ def normalize_time_slot(val):
     return s
 
 def init_data_files():
-    # 予算・前年データの初期化（スプレッドシートが空の場合に書き込む）
     try:
         df_b = conn.read(worksheet="budget_prev", ttl=0).dropna(how="all")
         if df_b.empty:
@@ -66,13 +65,12 @@ def init_data_files():
                                     "budget_sales": b_sales, "prev_sales": p_sales, "prev_cust": p_cust
                                 })
             conn.update(worksheet="budget_prev", data=pd.DataFrame(records))
-    except Exception as e:
-        pass # エラー時は無視（通常は動作するため）
+    except Exception:
+        pass
 
 init_data_files()
 
 def get_available_months():
-    # クラウド環境ではOUTPUTフォルダ内のCSVから取得
     all_files = glob.glob(os.path.join(OUTPUT_DIR, "*.csv"))
     months = set()
     for f in all_files:
@@ -128,7 +126,7 @@ def load_reservation_sales():
     except:
         return pd.DataFrame(columns=["id", "reservation_id", "store", "date", "time_slot", "amount"])
 
-# --- スプレッドシートへのセーブ関数群 ---
+# --- スプレッドシートへの保存関数群 ---
 def save_delivery_data(date_str, store, time_slot, uber, rocket_now, demaekan, other):
     df = load_delivery_data()
     df = df[~((df["date"] == date_str) & (df["store"] == store) & (df["time_slot"] == time_slot))]
@@ -440,16 +438,31 @@ display_year = st.session_state["display_year"]
 months_in_year = [m for m in available_months if m.startswith(display_year)] or [f"{display_year}-01"]
 st.sidebar.selectbox("対象月", months_in_year, key="selected_year_month")
 
+# --- 売上データ取得ブロック（エラーを赤枠で詳しく表示するように改善） ---
 with st.sidebar.expander("📥 売上データを取得する"):
     target_date = st.date_input("取得日", value=datetime.now().date(), key="fetch_date_input_sidebar")
     if st.button("🚀 取得実行", type="primary"):
         target_str = target_date.strftime("%Y-%m-%d")
-        with st.spinner(f"{target_str} 取得中... (別の操作をするとキャンセルされます)"):
+        with st.spinner(f"{target_str} 取得中... (完了までお待ちください)"):
             try:
-                subprocess.run(["python", "get_monthly_data.py", target_str, target_str], capture_output=True, text=True, encoding="utf-8", errors="replace", check=True)
+                res = subprocess.run(
+                    ["python", "get_monthly_data.py", target_str, target_str],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=True
+                )
                 st.success(f"🎉 取得完了！")
                 st.rerun()
-            except subprocess.CalledProcessError: st.warning("⚠️ データ取得をキャンセルしました。")
+            except subprocess.CalledProcessError as e:
+                st.error("⚠️ データ取得処理でエラーが発生しました。")
+                err_detail = ""
+                if e.stderr:
+                    err_detail += f"【標準エラー】:\n{e.stderr}\n\n"
+                if e.stdout:
+                    err_detail += f"【標準出力】:\n{e.stdout}"
+                st.code(err_detail if err_detail else "エラーメッセージはありませんでした。", language="text")
 
 st.sidebar.markdown("---")
 app_mode = st.sidebar.radio("機能を選択してください", ["📊 本部用（月報一覧表示）", "📱 店舗用（実績入力）", "📋 エクセルコピペ用データ生成", "📄 報告書作成"])
