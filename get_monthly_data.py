@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 
 load_dotenv()
+
+# Streamlit Secretsまたは環境変数から取得
 AIRREGI_ID = os.getenv("AIRREGI_ID")
 AIRREGI_PASS = os.getenv("AIRREGI_PASS")
 
@@ -22,9 +24,13 @@ TARGET_STORES = [
 ]
 
 def auto_login(page):
-    page.goto("https://airregi.jp/CLP/view/top/")
-    page.wait_for_timeout(2000)
-    
+    if not AIRREGI_ID or not AIRREGI_PASS:
+        print("[WARNING] AIRREGI_ID または AIRREGI_PASS が設定されていません。StreamlitのSecretsを確認してください。")
+
+    page.goto("https://airregi.jp/CLP/view/top/", wait_until="domcontentloaded")
+    page.wait_for_timeout(3000)
+
+    # ログイン画面またはログインボタンがある場合
     if "login" in page.url or page.locator("input[name='account']").is_visible() or page.get_by_role("button", name="ログイン").is_visible():
         print("・ログイン処理を自動実行中...")
         if page.get_by_role("button", name="ログイン").is_visible() and "login" not in page.url:
@@ -32,19 +38,26 @@ def auto_login(page):
             page.wait_for_timeout(2000)
 
         id_input = page.locator("input[name='account'], input[name='loginId'], input[type='text']").first
-        if id_input.is_visible():
+        if id_input.is_visible() and AIRREGI_ID:
             id_input.fill(AIRREGI_ID)
-        
+
         pass_input = page.locator("input[name='password'], input[type='password']").first
-        if pass_input.is_visible():
+        if pass_input.is_visible() and AIRREGI_PASS:
             pass_input.fill(AIRREGI_PASS)
 
         login_btn = page.locator("button[type='submit'], input[type='submit'], button:has-text('ログイン')").first
         login_btn.click()
-        page.wait_for_timeout(3000)
+        
+        # ログイン後のページ読み込み完了を待機
+        try:
+            page.wait_for_load_state("networkidle", timeout=15000)
+        except Exception:
+            page.wait_for_timeout(5000)
 
 def select_store(page, store_name, is_first_store=False):
     print(f"\n--- 【店舗切り替え】「{store_name}」へ移動 ---")
+    page.wait_for_timeout(2000)
+
     if page.locator("text='利用する店舗を選択'").is_visible() or page.locator("text='店舗を選択'").is_visible():
         page.wait_for_selector(f"text='{store_name}'", timeout=15000)
         page.locator(f"text='{store_name}'").first.click()
@@ -61,7 +74,7 @@ def select_store(page, store_name, is_first_store=False):
     store_trigger = page.locator("header button, header a, div[class*='shop'], div[class*='Header']").filter(has_text="店").first
     if not store_trigger.is_visible():
         store_trigger = page.get_by_text("三田おにぎり").or_(page.get_by_text("おにぎり維心")).first
-    
+
     store_trigger.click()
     page.wait_for_timeout(1500)
     page.locator("text='店舗切り替え'").first.click()
@@ -80,14 +93,12 @@ def navigate_to_sales_page(page):
     page.wait_for_timeout(2500)
 
 def extract_sales_for_date(page, target_date):
-    """指定日付の日付プルダウンを確実に操作してデータを取得する"""
     dt = datetime.strptime(target_date, "%Y-%m-%d")
     year_str, month_str, day_str = f"{dt.year}年", f"{dt.month}月", f"{dt.day}日"
     day_num_str = f"{dt.day}日"
 
     print(f"・ {target_date} ({year_str} {month_str} {day_num_str}) のデータを指定中...")
 
-    # 集計対象が「時間別」になっているか確認・変更
     try:
         page.evaluate("""() => {
             const selects = Array.from(document.querySelectorAll('select'));
@@ -104,8 +115,7 @@ def extract_sales_for_date(page, target_date):
     except Exception:
         pass
 
-    # 日付のプルダウン操作（標準selectおよびカスタム要素へのフォールバック）
-    success = page.evaluate("""({ yearStr, monthStr, dayNumStr }) => {
+    page.evaluate("""({ yearStr, monthStr, dayNumStr }) => {
         const selects = Array.from(document.querySelectorAll('select'));
         let changed = false;
         for (let sel of selects) {
@@ -123,13 +133,11 @@ def extract_sales_for_date(page, target_date):
 
     page.wait_for_timeout(1000)
 
-    # 「表示する」ボタンをクリック
     btn = page.locator("button:has-text('表示する'), button:has-text('表示'), input[value*='表示']").first
     if btn.is_visible():
         btn.click(force=True)
         page.wait_for_timeout(3500)
 
-    # テーブル行の抽出
     rows = page.locator("table tr").all()
     store_rows = []
     for row in rows:
@@ -152,7 +160,7 @@ def main():
 
     start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
-    
+
     date_list = []
     curr = start_dt
     while curr <= end_dt:
@@ -161,11 +169,19 @@ def main():
 
     print(f"=== 対象期間: {start_date_str} 〜 {end_date_str} ({len(date_list)}日間) ===")
 
+    # 前回のエラー画像があれば削除
+    screenshot_path = "error_screenshot.png"
+    if os.path.exists(screenshot_path):
+        try:
+            os.remove(screenshot_path)
+        except Exception:
+            pass
+
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
             headless=True,
-           args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         )
         page = context.new_page()
 
@@ -179,7 +195,7 @@ def main():
                 for index, store_name in enumerate(TARGET_STORES):
                     is_first = (index == 0)
                     select_store(page, store_name, is_first_store=is_first)
-                    
+
                     if index == 0 and target_date == date_list[0]:
                         navigate_to_sales_page(page)
                     else:
@@ -201,6 +217,12 @@ def main():
 
         except Exception as e:
             print(f"[ERROR] 処理中にエラーが発生しました: {e}")
+            try:
+                page.screenshot(path=screenshot_path)
+                print(f"エラー発生時の画面を保存しました: {screenshot_path}")
+            except Exception:
+                pass
+            raise e
         finally:
             context.close()
 
