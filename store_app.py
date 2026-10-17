@@ -439,7 +439,7 @@ display_year = st.session_state["display_year"]
 months_in_year = [m for m in available_months if m.startswith(display_year)] or [f"{display_year}-01"]
 st.sidebar.selectbox("対象月", months_in_year, key="selected_year_month")
 
-# --- 売上データ取得ブロック（環境変数を明示的に子プロセスへ引き渡す） ---
+# --- 売上データ取得ブロック ---
 with st.sidebar.expander("📥 売上データを取得する"):
     target_date = st.date_input("取得日", value=datetime.now().date(), key="fetch_date_input_sidebar")
     if st.button("🚀 取得実行", type="primary"):
@@ -453,12 +453,29 @@ with st.sidebar.expander("📥 売上データを取得する"):
                     check=True
                 )
                 
-                # StreamlitのSecretsから環境変数を引き継ぐ
+                # StreamlitのSecretsから環境変数を引き継ぐ（トップレベルおよび接続設定内を両方探索）
                 custom_env = os.environ.copy()
+                air_id = None
+                air_pass = None
+
+                # トップレベルから取得
                 if "AIRREGI_ID" in st.secrets:
-                    custom_env["AIRREGI_ID"] = str(st.secrets["AIRREGI_ID"])
+                    air_id = st.secrets["AIRREGI_ID"]
                 if "AIRREGI_PASS" in st.secrets:
-                    custom_env["AIRREGI_PASS"] = str(st.secrets["AIRREGI_PASS"])
+                    air_pass = st.secrets["AIRREGI_PASS"]
+
+                # connections.gsheets 内に配置されている場合もフォールバックで救済
+                if not air_id and "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+                    gsheets_sec = st.secrets["connections"]["gsheets"]
+                    if "AIRREGI_ID" in gsheets_sec:
+                        air_id = gsheets_sec["AIRREGI_ID"]
+                    if "AIRREGI_PASS" in gsheets_sec:
+                        air_pass = gsheets_sec["AIRREGI_PASS"]
+
+                if air_id:
+                    custom_env["AIRREGI_ID"] = str(air_id)
+                if air_pass:
+                    custom_env["AIRREGI_PASS"] = str(air_pass)
 
                 # データ取得スクリプト実行（envを指定）
                 res = subprocess.run(
@@ -497,7 +514,6 @@ with st.sidebar.expander("📥 売上データを取得する"):
                     err_detail += f"【標準出力】:\n{e.stdout}"
                 st.code(err_detail if err_detail else "エラーメッセージはありませんでした。", language="text")
                 
-                # エラー発生時の画面スクリーンショットがあれば表示
                 if os.path.exists("error_screenshot.png"):
                     st.image("error_screenshot.png", caption="エラー発生時のブラウザ画面")
 
