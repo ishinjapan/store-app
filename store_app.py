@@ -444,8 +444,16 @@ with st.sidebar.expander("📥 売上データを取得する"):
     target_date = st.date_input("取得日", value=datetime.now().date(), key="fetch_date_input_sidebar")
     if st.button("🚀 取得実行", type="primary"):
         target_str = target_date.strftime("%Y-%m-%d")
-        with st.spinner(f"{target_str} 取得中... (完了までお待ちください)"):
+        with st.spinner(f"{target_str} 取得中... (初回はブラウザ初期化に数分かかる場合があります)"):
             try:
+                # Playwright Chromiumブラウザを自動インストール
+                subprocess.run(
+                    [sys.executable, "-m", "playwright", "install", "chromium"],
+                    capture_output=True,
+                    check=True
+                )
+                
+                # データ取得スクリプト実行
                 res = subprocess.run(
                     [sys.executable, "get_monthly_data.py", target_str, target_str],
                     capture_output=True,
