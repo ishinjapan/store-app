@@ -1,3 +1,8 @@
 streamlit
 pandas
 openpyxl
+selenium
+webdriver-manager
+beautifulsoup4
+requests
+st-gsheets-connection

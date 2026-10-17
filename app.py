@@ -8,6 +8,7 @@ import glob
 import subprocess
 import io
 import uuid
+from streamlit_gsheets import GSheetsConnection # スプレッドシート用に追加
 
 # openpyxlのスタイリング設定用モジュール
 from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
@@ -19,15 +20,12 @@ st.set_page_config(
     layout="wide"
 )
 
-OUTPUT_DIR = os.path.abspath("./output")
-DATA_DIR = os.path.abspath("./data")
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(DATA_DIR, exist_ok=True)
+# スプレッドシートとの接続
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-BUDGET_PREV_PATH = os.path.join(DATA_DIR, "budget_prev.csv")
-DELIVERY_DATA_PATH = os.path.join(DATA_DIR, "delivery_sales.csv")
-RESERVATIONS_PATH = os.path.join(DATA_DIR, "reservations.csv")
-RESERVATION_SALES_PATH = os.path.join(DATA_DIR, "reservation_sales.csv")
+# Airレジからの取得データ(CSV)は一時的にローカル出力フォルダを使用
+OUTPUT_DIR = os.path.abspath("./output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # 店舗定義
 STORE_CREDENTIALS = {
@@ -48,36 +46,33 @@ def normalize_time_slot(val):
     return s
 
 def init_data_files():
-    if not os.path.exists(BUDGET_PREV_PATH):
-        records = []
-        for year in [2025, 2026]:
-            for month in range(1, 13):
-                _, max_days = calendar.monthrange(year, month)
-                for day in range(1, max_days + 1):
-                    date_str = f"{year}-{month:02d}-{day:02d}"
-                    for store in STORES:
-                        for slot in TIME_SLOTS:
-                            if slot == "早番": b_sales, p_sales, p_cust = 88000, 77645, 90
-                            elif slot == "中番": b_sales, p_sales, p_cust = 157000, 153848, 194
-                            else: b_sales, p_sales, p_cust = 55000, 48521, 78
-                            records.append({
-                                "date": date_str, "store": store, "time_slot": slot,
-                                "budget_sales": b_sales, "prev_sales": p_sales, "prev_cust": p_cust
-                            })
-        pd.DataFrame(records).to_csv(BUDGET_PREV_PATH, index=False, encoding="utf-8-sig")
-
-    if not os.path.exists(DELIVERY_DATA_PATH):
-        pd.DataFrame(columns=["date", "store", "time_slot", "uber", "rocket_now", "demaekan", "other"]).to_csv(DELIVERY_DATA_PATH, index=False, encoding="utf-8-sig")
-    
-    if not os.path.exists(RESERVATIONS_PATH):
-        pd.DataFrame(columns=["id", "store", "date", "time_slot", "management_name", "amount", "customer_name", "phone", "notes"]).to_csv(RESERVATIONS_PATH, index=False, encoding="utf-8-sig")
-        
-    if not os.path.exists(RESERVATION_SALES_PATH):
-        pd.DataFrame(columns=["id", "reservation_id", "store", "date", "time_slot", "amount"]).to_csv(RESERVATION_SALES_PATH, index=False, encoding="utf-8-sig")
+    # 予算・前年データの初期化（スプレッドシートが空の場合に書き込む）
+    try:
+        df_b = conn.read(worksheet="budget_prev", ttl=0).dropna(how="all")
+        if df_b.empty:
+            records = []
+            for year in [2025, 2026]:
+                for month in range(1, 13):
+                    _, max_days = calendar.monthrange(year, month)
+                    for day in range(1, max_days + 1):
+                        date_str = f"{year}-{month:02d}-{day:02d}"
+                        for store in STORES:
+                            for slot in TIME_SLOTS:
+                                if slot == "早番": b_sales, p_sales, p_cust = 88000, 77645, 90
+                                elif slot == "中番": b_sales, p_sales, p_cust = 157000, 153848, 194
+                                else: b_sales, p_sales, p_cust = 55000, 48521, 78
+                                records.append({
+                                    "date": date_str, "store": store, "time_slot": slot,
+                                    "budget_sales": b_sales, "prev_sales": p_sales, "prev_cust": p_cust
+                                })
+            conn.update(worksheet="budget_prev", data=pd.DataFrame(records))
+    except Exception as e:
+        pass # エラー時は無視（通常は動作するため）
 
 init_data_files()
 
 def get_available_months():
+    # クラウド環境ではOUTPUTフォルダ内のCSVから取得
     all_files = glob.glob(os.path.join(OUTPUT_DIR, "*.csv"))
     months = set()
     for f in all_files:
@@ -88,49 +83,65 @@ def get_available_months():
         return [datetime.now().strftime("%Y-%m")]
     return sorted(list(months), reverse=True)
 
+# --- スプレッドシートからのロード関数群 ---
 def load_budget_prev_data():
-    df = pd.read_csv(BUDGET_PREV_PATH)
-    df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
-    return df
+    try:
+        df = conn.read(worksheet="budget_prev", ttl=0).dropna(how="all")
+        if not df.empty:
+            df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
+        return df
+    except:
+        return pd.DataFrame(columns=["date", "store", "time_slot", "budget_sales", "prev_sales", "prev_cust"])
 
 def load_delivery_data():
-    df = pd.read_csv(DELIVERY_DATA_PATH)
-    df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
-    if "rn" in df.columns and "rocket_now" not in df.columns:
-        df = df.rename(columns={"rn": "rocket_now"})
-    return df
+    try:
+        df = conn.read(worksheet="delivery_sales", ttl=0).dropna(how="all")
+        if not df.empty:
+            df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
+            if "rn" in df.columns and "rocket_now" not in df.columns:
+                df = df.rename(columns={"rn": "rocket_now"})
+            return df
+        return pd.DataFrame(columns=["date", "store", "time_slot", "uber", "rocket_now", "demaekan", "other"])
+    except:
+        return pd.DataFrame(columns=["date", "store", "time_slot", "uber", "rocket_now", "demaekan", "other"])
 
 def load_reservations():
-    dtypes = {
-        "id": str, "store": str, "date": str, "time_slot": str, 
-        "management_name": str, "customer_name": str, "phone": str, "notes": str
-    }
-    df = pd.read_csv(RESERVATIONS_PATH, dtype=dtypes)
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
-    return df
+    try:
+        df = conn.read(worksheet="reservations", ttl=0).dropna(how="all")
+        if not df.empty:
+            df["id"] = df["id"].astype(str)
+            df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
+            return df
+        return pd.DataFrame(columns=["id", "store", "date", "time_slot", "management_name", "amount", "customer_name", "phone", "notes"])
+    except:
+        return pd.DataFrame(columns=["id", "store", "date", "time_slot", "management_name", "amount", "customer_name", "phone", "notes"])
 
 def load_reservation_sales():
-    dtypes = {
-        "id": str, "reservation_id": str, "store": str, "date": str, "time_slot": str
-    }
-    df = pd.read_csv(RESERVATION_SALES_PATH, dtype=dtypes)
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
-    return df
+    try:
+        df = conn.read(worksheet="reservation_sales", ttl=0).dropna(how="all")
+        if not df.empty:
+            df["id"] = df["id"].astype(str)
+            df["reservation_id"] = df["reservation_id"].astype(str)
+            df["amount"] = pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
+            return df
+        return pd.DataFrame(columns=["id", "reservation_id", "store", "date", "time_slot", "amount"])
+    except:
+        return pd.DataFrame(columns=["id", "reservation_id", "store", "date", "time_slot", "amount"])
 
+# --- スプレッドシートへのセーブ関数群 ---
 def save_delivery_data(date_str, store, time_slot, uber, rocket_now, demaekan, other):
     df = load_delivery_data()
     df = df[~((df["date"] == date_str) & (df["store"] == store) & (df["time_slot"] == time_slot))]
     new_row = pd.DataFrame([{"date": date_str, "store": store, "time_slot": time_slot, "uber": uber, "rocket_now": rocket_now, "demaekan": demaekan, "other": other}])
     df = pd.concat([df, new_row], ignore_index=True)
-    df.to_csv(DELIVERY_DATA_PATH, index=False, encoding="utf-8-sig")
+    conn.update(worksheet="delivery_sales", data=df)
 
-# --- 予約関連のCRUD関数 ---
 def save_reservation(store, date_str, time_slot, mng_name, amount, cust_name, phone, notes):
     df = load_reservations()
     res_id = str(uuid.uuid4())
     new_row = pd.DataFrame([{"id": res_id, "store": store, "date": date_str, "time_slot": time_slot, "management_name": mng_name, "amount": amount, "customer_name": cust_name, "phone": phone, "notes": notes}])
     df = pd.concat([df, new_row], ignore_index=True)
-    df.to_csv(RESERVATIONS_PATH, index=False, encoding="utf-8-sig")
+    conn.update(worksheet="reservations", data=df)
 
 def update_reservation(res_id, date_str, time_slot, mng_name, amount, cust_name, phone, notes):
     df = load_reservations()
@@ -143,22 +154,24 @@ def update_reservation(res_id, date_str, time_slot, mng_name, amount, cust_name,
         df.at[idx[0], "customer_name"] = str(cust_name) if cust_name else ""
         df.at[idx[0], "phone"] = str(phone) if phone else ""
         df.at[idx[0], "notes"] = str(notes) if notes else ""
-        df.to_csv(RESERVATIONS_PATH, index=False, encoding="utf-8-sig")
+        conn.update(worksheet="reservations", data=df)
 
 def delete_reservation(res_id):
     df = load_reservations()
     df = df[df["id"] != res_id]
-    df.to_csv(RESERVATIONS_PATH, index=False, encoding="utf-8-sig")
+    conn.update(worksheet="reservations", data=df)
+    
     sales_df = load_reservation_sales()
-    sales_df = sales_df[sales_df["reservation_id"] != res_id]
-    sales_df.to_csv(RESERVATION_SALES_PATH, index=False, encoding="utf-8-sig")
+    if not sales_df.empty:
+        sales_df = sales_df[sales_df["reservation_id"] != res_id]
+        conn.update(worksheet="reservation_sales", data=sales_df)
 
 def save_reservation_sale(res_id, store, date_str, time_slot, amount):
     df = load_reservation_sales()
     sale_id = str(uuid.uuid4())
     new_row = pd.DataFrame([{"id": sale_id, "reservation_id": res_id, "store": store, "date": date_str, "time_slot": time_slot, "amount": amount}])
     df = pd.concat([df, new_row], ignore_index=True)
-    df.to_csv(RESERVATION_SALES_PATH, index=False, encoding="utf-8-sig")
+    conn.update(worksheet="reservation_sales", data=df)
 
 def update_reservation_sale(sale_id, date_str, time_slot, amount):
     df = load_reservation_sales()
@@ -167,12 +180,12 @@ def update_reservation_sale(sale_id, date_str, time_slot, amount):
         df.at[idx[0], "date"] = date_str
         df.at[idx[0], "time_slot"] = time_slot
         df.at[idx[0], "amount"] = amount
-        df.to_csv(RESERVATION_SALES_PATH, index=False, encoding="utf-8-sig")
+        conn.update(worksheet="reservation_sales", data=df)
 
 def delete_reservation_sale(sale_id):
     df = load_reservation_sales()
     df = df[df["id"] != sale_id]
-    df.to_csv(RESERVATION_SALES_PATH, index=False, encoding="utf-8-sig")
+    conn.update(worksheet="reservation_sales", data=df)
 
 def parse_int(val):
     if pd.isna(val): return 0
@@ -207,8 +220,8 @@ def generate_month_df(selected_store, year, month, target_slot_keyword, bp_df, d
     for day in range(1, max_days + 1):
         date_str = f"{year:04d}-{month:02d}-{day:02d}"
         
-        bp_sub = bp_df[(bp_df["date"] == date_str) & (bp_df["store"] == selected_store)]
-        if target_slot_keyword: bp_sub = bp_sub[bp_sub["time_slot"] == target_slot_keyword]
+        bp_sub = bp_df[(bp_df["date"] == date_str) & (bp_df["store"] == selected_store)] if not bp_df.empty else pd.DataFrame()
+        if target_slot_keyword and not bp_sub.empty: bp_sub = bp_sub[bp_sub["time_slot"] == target_slot_keyword]
         p_sales = parse_int(bp_sub["prev_sales"].sum()) if not bp_sub.empty else 0
         b_sales = parse_int(bp_sub["budget_sales"].sum()) if not bp_sub.empty else 0
         p_cust = parse_int(bp_sub["prev_cust"].sum()) if not bp_sub.empty else 0
@@ -226,19 +239,19 @@ def generate_month_df(selected_store, year, month, target_slot_keyword, bp_df, d
                     if matched.shape[1] > 11: air_other_sales = parse_int(matched.iloc[0, 11])
             except: pass
 
-        deliv_sub = deliv_df[(deliv_df["date"] == date_str) & (deliv_df["store"] == selected_store)]
-        if target_slot_keyword: deliv_sub = deliv_sub[deliv_sub["time_slot"] == target_slot_keyword]
+        deliv_sub = deliv_df[(deliv_df["date"] == date_str) & (deliv_df["store"] == selected_store)] if not deliv_df.empty else pd.DataFrame()
+        if target_slot_keyword and not deliv_sub.empty: deliv_sub = deliv_sub[deliv_sub["time_slot"] == target_slot_keyword]
         day_delivery_sales, deliv_other_sales = 0, 0
         if not deliv_sub.empty:
             day_delivery_sales = int(pd.to_numeric(deliv_sub["uber"], errors="coerce").fillna(0).sum() + pd.to_numeric(deliv_sub["rocket_now"], errors="coerce").fillna(0).sum() + pd.to_numeric(deliv_sub["demaekan"], errors="coerce").fillna(0).sum())
             deliv_other_sales = int(pd.to_numeric(deliv_sub["other"], errors="coerce").fillna(0).sum())
 
-        res_sub = res_df[(res_df["date"] == date_str) & (res_df["store"] == selected_store)]
-        if target_slot_keyword: res_sub = res_sub[(res_sub["time_slot"] == target_slot_keyword) | (res_sub["time_slot"] == "時間帯未指定")]
+        res_sub = res_df[(res_df["date"] == date_str) & (res_df["store"] == selected_store)] if not res_df.empty else pd.DataFrame()
+        if target_slot_keyword and not res_sub.empty: res_sub = res_sub[(res_sub["time_slot"] == target_slot_keyword) | (res_sub["time_slot"] == "時間帯未指定")]
         day_res_deposit = -int(pd.to_numeric(res_sub["amount"], errors="coerce").fillna(0).sum()) if not res_sub.empty else 0
 
-        rs_sub = res_sales_df[(res_sales_df["date"] == date_str) & (res_sales_df["store"] == selected_store)]
-        if target_slot_keyword: rs_sub = rs_sub[rs_sub["time_slot"] == target_slot_keyword]
+        rs_sub = res_sales_df[(res_sales_df["date"] == date_str) & (res_sales_df["store"] == selected_store)] if not res_sales_df.empty else pd.DataFrame()
+        if target_slot_keyword and not rs_sub.empty: rs_sub = rs_sub[rs_sub["time_slot"] == target_slot_keyword]
         day_res_sales = int(pd.to_numeric(rs_sub["amount"], errors="coerce").fillna(0).sum()) if not rs_sub.empty else 0
 
         adjusted_air_sales = air_sales + day_res_deposit + day_res_sales
@@ -394,7 +407,6 @@ if "selected_store" not in st.session_state: st.session_state["selected_store"] 
 if "display_year" not in st.session_state: st.session_state["display_year"] = available_years[0] if available_years else str(datetime.now().year)
 if "target_date_state" not in st.session_state: st.session_state["target_date_state"] = datetime.now().date()
 
-# フォームクリア用のカウンター初期化
 if "form_d_key" not in st.session_state: st.session_state["form_d_key"] = 0
 if "form_r_key" not in st.session_state: st.session_state["form_r_key"] = 0
 if "form_s_key" not in st.session_state: st.session_state["form_s_key"] = 0
@@ -481,7 +493,6 @@ if app_mode == "📱 店舗用（実績入力）":
     
     tab_input, tab_manage = st.tabs(["📝 日次入力 (デリバリー / 予約)", "⚙️ 予約データの確認・修正・削除"])
     
-    # --- 1. 日次入力タブ ---
     with tab_input:
         st.markdown("""
             <div style="background-color: #e3f2fd; padding: 10px 20px; border-radius: 5px; border-left: 5px solid #1976d2; margin-bottom: 15px;">
@@ -495,7 +506,6 @@ if app_mode == "📱 店舗用（実績入力）":
         selected_date = selected_date_val.strftime("%Y-%m-%d")
         st.markdown("---")
 
-        # 1-1. デリバリー入力
         st.subheader(f"🛵 1. デリバリー売上 【対象: {selected_date} / {selected_slot}】")
         just_saved_deliv = False
         if "msg_deliv" in st.session_state:
@@ -555,7 +565,6 @@ if app_mode == "📱 店舗用（実績入力）":
 
         st.markdown("---")
 
-        # 1-2. 予約売上計上 (商品引渡)
         st.subheader(f"📈 2. 予約売上計上（商品引渡）【計上日: {selected_date} / {selected_slot}】")
         if "msg_res_sales" in st.session_state:
             st.success(st.session_state["msg_res_sales"])
@@ -600,7 +609,6 @@ if app_mode == "📱 店舗用（実績入力）":
 
         st.markdown("---")
         
-        # 1-3. 予約預かり金 (入金)
         st.subheader(f"📥 3. 予約入金（事前預かり）【入金日: {selected_date}】")
         if "msg_res_dep" in st.session_state:
             st.success(st.session_state["msg_res_dep"])
@@ -631,7 +639,6 @@ if app_mode == "📱 店舗用（実績入力）":
                 st.rerun()
             else: st.error("管理名と預かり金額を入力してください。")
 
-    # --- 2. 予約データの管理・修正タブ ---
     with tab_manage:
         if "flash_msg_manage" in st.session_state:
             st.success(st.session_state["flash_msg_manage"])
@@ -972,7 +979,7 @@ else:
     }]
 
     def render_styled_html_table(df, is_summary=False):
-        header_bg, header_color = "#f39c12", "#ffffff"
+        header_bg, header_color = ("#f39c12", "#ffffff")
         wrap_style = "overflow-x: auto; margin-bottom: 20px;" if is_summary else "max-height: 60vh; overflow-y: auto; overflow-x: auto; margin-bottom: 20px;"
         
         html = f'<div style="{wrap_style}"><table style="width: 100%; border-collapse: collapse; font-family: sans-serif; font-size: 14px; white-space: nowrap;"><thead><tr style="text-align: center;">'
