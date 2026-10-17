@@ -8,7 +8,6 @@ from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
-# Streamlit Secretsまたは環境変数から取得
 AIRREGI_ID = os.getenv("AIRREGI_ID")
 AIRREGI_PASS = os.getenv("AIRREGI_PASS")
 
@@ -25,39 +24,78 @@ TARGET_STORES = [
 
 def auto_login(page):
     if not AIRREGI_ID or not AIRREGI_PASS:
-        print("[WARNING] AIRREGI_ID または AIRREGI_PASS が設定されていません。StreamlitのSecretsを確認してください。")
+        print("[WARNING] AIRREGI_ID または AIRREGI_PASS が未設定です。")
+        return
 
-    page.goto("https://airregi.jp/CLP/view/top/", wait_until="domcontentloaded")
+    print("・Airレジ トップページへアクセス中...")
+    page.goto("https://airregi.jp/CLP/view/top/", wait_until="networkidle")
     page.wait_for_timeout(3000)
 
-    # ログイン画面またはログインボタンがある場合
-    if "login" in page.url or page.locator("input[name='account']").is_visible() or page.get_by_role("button", name="ログイン").is_visible():
-        print("・ログイン処理を自動実行中...")
-        if page.get_by_role("button", name="ログイン").is_visible() and "login" not in page.url:
-            page.get_by_role("button", name="ログイン").click()
-            page.wait_for_timeout(2000)
+    # ログインボタンのみがあるLP画面の場合はクリック
+    login_btn_initial = page.locator("a:has-text('ログイン'), button:has-text('ログイン')").first
+    if login_btn_initial.is_visible() and not page.locator("input[type='password']").is_visible():
+        print("・ログイン画面へ遷移します...")
+        login_btn_initial.click()
+        page.wait_for_timeout(3000)
 
-        id_input = page.locator("input[name='account'], input[name='loginId'], input[type='text']").first
-        if id_input.is_visible() and AIRREGI_ID:
-            id_input.fill(AIRREGI_ID)
+    # 入力フォームの存在を確認
+    id_selectors = [
+        "input[name='command.common.loginId']",
+        "input[name='account']",
+        "input[name='loginId']",
+        "input[autocomplete='username']",
+        "input[type='text']"
+    ]
+    pass_selectors = [
+        "input[name='command.common.password']",
+        "input[name='password']",
+        "input[type='password']"
+    ]
 
-        pass_input = page.locator("input[name='password'], input[type='password']").first
-        if pass_input.is_visible() and AIRREGI_PASS:
-            pass_input.fill(AIRREGI_PASS)
+    target_id_input = None
+    for sel in id_selectors:
+        loc = page.locator(sel).first
+        if loc.is_visible():
+            target_id_input = loc
+            break
 
-        login_btn = page.locator("button[type='submit'], input[type='submit'], button:has-text('ログイン')").first
-        login_btn.click()
+    target_pass_input = None
+    for sel in pass_selectors:
+        loc = page.locator(sel).first
+        if loc.is_visible():
+            target_pass_input = loc
+            break
+
+    if target_id_input and target_pass_input:
+        print("・ID/パスワードを入力中...")
+        target_id_input.click()
+        target_id_input.fill("")
+        target_id_input.fill(AIRREGI_ID)
+        page.wait_for_timeout(500)
+
+        target_pass_input.click()
+        target_pass_input.fill("")
+        target_pass_input.fill(AIRREGI_PASS)
+        page.wait_for_timeout(500)
+
+        submit_btn = page.locator("button[type='submit'], input[type='submit'], button:has-text('ログイン')").first
+        print("・ログインボタンを押下...")
+        submit_btn.click()
         
-        # ログイン後のページ読み込み完了を待機
+        # ログイン完了待機（管理画面への遷移）
         try:
-            page.wait_for_load_state("networkidle", timeout=15000)
+            page.wait_for_selector("text='店舗を選択'", timeout=15000)
+            print("・店舗選択画面を確認しました。")
         except Exception:
-            page.wait_for_timeout(5000)
+            page.wait_for_timeout(7000)
+    else:
+        print("[WARNING] ログインフォームの入力欄が見つかりませんでした。")
 
 def select_store(page, store_name, is_first_store=False):
     print(f"\n--- 【店舗切り替え】「{store_name}」へ移動 ---")
     page.wait_for_timeout(2000)
 
+    # 初回店舗選択モーダルまたは一覧
     if page.locator("text='利用する店舗を選択'").is_visible() or page.locator("text='店舗を選択'").is_visible():
         page.wait_for_selector(f"text='{store_name}'", timeout=15000)
         page.locator(f"text='{store_name}'").first.click()
@@ -71,6 +109,7 @@ def select_store(page, store_name, is_first_store=False):
         except Exception:
             pass
 
+    # ヘッダーの店舗切り替えボタン
     store_trigger = page.locator("header button, header a, div[class*='shop'], div[class*='Header']").filter(has_text="店").first
     if not store_trigger.is_visible():
         store_trigger = page.get_by_text("三田おにぎり").or_(page.get_by_text("おにぎり維心")).first
@@ -169,7 +208,6 @@ def main():
 
     print(f"=== 対象期間: {start_date_str} 〜 {end_date_str} ({len(date_list)}日間) ===")
 
-    # 前回のエラー画像があれば削除
     screenshot_path = "error_screenshot.png"
     if os.path.exists(screenshot_path):
         try:
