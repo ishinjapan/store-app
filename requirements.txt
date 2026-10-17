@@ -6,3 +6,4 @@ webdriver-manager
 beautifulsoup4
 requests
 st-gsheets-connection
+playwright
