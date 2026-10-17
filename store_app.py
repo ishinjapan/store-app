@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import os
+import sys
 import re
 from datetime import datetime
 import calendar
@@ -438,7 +439,7 @@ display_year = st.session_state["display_year"]
 months_in_year = [m for m in available_months if m.startswith(display_year)] or [f"{display_year}-01"]
 st.sidebar.selectbox("対象月", months_in_year, key="selected_year_month")
 
-# --- 売上データ取得ブロック（エラーを赤枠で詳しく表示するように改善） ---
+# --- 売上データ取得ブロック ---
 with st.sidebar.expander("📥 売上データを取得する"):
     target_date = st.date_input("取得日", value=datetime.now().date(), key="fetch_date_input_sidebar")
     if st.button("🚀 取得実行", type="primary"):
@@ -446,7 +447,7 @@ with st.sidebar.expander("📥 売上データを取得する"):
         with st.spinner(f"{target_str} 取得中... (完了までお待ちください)"):
             try:
                 res = subprocess.run(
-                    ["python", "get_monthly_data.py", target_str, target_str],
+                    [sys.executable, "get_monthly_data.py", target_str, target_str],
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
