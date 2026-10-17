@@ -439,14 +439,14 @@ display_year = st.session_state["display_year"]
 months_in_year = [m for m in available_months if m.startswith(display_year)] or [f"{display_year}-01"]
 st.sidebar.selectbox("対象月", months_in_year, key="selected_year_month")
 
-# --- 売上データ取得ブロック ---
+# --- 売上データ取得ブロック（実行ログを画面に出力する構成） ---
 with st.sidebar.expander("📥 売上データを取得する"):
     target_date = st.date_input("取得日", value=datetime.now().date(), key="fetch_date_input_sidebar")
     if st.button("🚀 取得実行", type="primary"):
         target_str = target_date.strftime("%Y-%m-%d")
-        with st.spinner(f"{target_str} 取得中... (初回はブラウザ初期化に数分かかる場合があります)"):
+        with st.spinner(f"{target_str} 取得中... (完了までお待ちください)"):
             try:
-                # Playwright Chromiumブラウザを自動インストール
+                # Playwright Chromium自動インストール
                 subprocess.run(
                     [sys.executable, "-m", "playwright", "install", "chromium"],
                     capture_output=True,
@@ -462,8 +462,25 @@ with st.sidebar.expander("📥 売上データを取得する"):
                     errors="replace",
                     check=True
                 )
-                st.success(f"🎉 取得完了！")
-                st.rerun()
+                st.success("🎉 取得処理が完了しました")
+                
+                # 実行ログをアコーディオンで常時確認可能にする
+                with st.expander("📄 実行ログ（標準出力 / エラー）", expanded=True):
+                    if res.stdout:
+                        st.markdown("**【標準出力】**")
+                        st.code(res.stdout, language="text")
+                    if res.stderr:
+                        st.markdown("**【標準エラー】**")
+                        st.code(res.stderr, language="text")
+                    
+                    # outputフォルダ内のCSVファイル確認
+                    created_files = glob.glob(os.path.join(OUTPUT_DIR, "*.csv"))
+                    st.markdown(f"**現在のCSV保存件数**: {len(created_files)} 件")
+                    if created_files:
+                        st.write([os.path.basename(f) for f in created_files])
+                    else:
+                        st.warning("⚠️ outputフォルダ内にCSVファイルが保存されていません。")
+                
             except subprocess.CalledProcessError as e:
                 st.error("⚠️ データ取得処理でエラーが発生しました。")
                 err_detail = ""
