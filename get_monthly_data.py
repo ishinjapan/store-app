@@ -28,75 +28,52 @@ def auto_login(page):
         return
 
     print("・Airレジ トップページへアクセス中...")
-    page.goto("https://airregi.jp/CLP/view/top/", wait_until="networkidle")
+    page.goto("https://airregi.jp/CLP/view/top/", wait_until="domcontentloaded")
     page.wait_for_timeout(3000)
 
     # ログインボタンのみがあるLP画面の場合はクリック
     login_btn_initial = page.locator("a:has-text('ログイン'), button:has-text('ログイン')").first
-    if login_btn_initial.is_visible() and not page.locator("input[type='password']").is_visible():
+    pass_input_check = page.locator("input#password, input[name='password']").first
+    if login_btn_initial.is_visible() and not pass_input_check.is_visible():
         print("・ログイン画面へ遷移します...")
         login_btn_initial.click()
         page.wait_for_timeout(3000)
 
-    # 入力フォームの存在を確認
-    id_selectors = [
-        "input[name='command.common.loginId']",
-        "input[name='account']",
-        "input[name='loginId']",
-        "input[autocomplete='username']",
-        "input[type='text']"
-    ]
-    pass_selectors = [
-        "input[name='command.common.password']",
-        "input[name='password']",
-        "input[type='password']"
-    ]
+    # 本物のID入力欄とパスワード入力欄を特定
+    id_input = page.locator("input#account, input[name='account'], input#loginId, input[name='loginId'], input[name='command.common.loginId']").first
+    pass_input = page.locator("input#password, input[name='password'], input[name='command.common.password']").first
 
-    target_id_input = None
-    for sel in id_selectors:
-        loc = page.locator(sel).first
-        if loc.is_visible():
-            target_id_input = loc
-            break
-
-    target_pass_input = None
-    for sel in pass_selectors:
-        loc = page.locator(sel).first
-        if loc.is_visible():
-            target_pass_input = loc
-            break
-
-    if target_id_input and target_pass_input:
-        print("・ID/パスワードを入力中...")
-        target_id_input.click()
-        target_id_input.fill("")
-        target_id_input.fill(AIRREGI_ID)
+    if id_input.is_visible() and pass_input.is_visible():
+        print("・本物のID/パスワード欄に入力中...")
+        id_input.click()
+        id_input.fill("")
+        id_input.fill(AIRREGI_ID)
         page.wait_for_timeout(500)
 
-        target_pass_input.click()
-        target_pass_input.fill("")
-        target_pass_input.fill(AIRREGI_PASS)
+        pass_input.click()
+        pass_input.fill("")
+        pass_input.fill(AIRREGI_PASS)
         page.wait_for_timeout(500)
 
-        submit_btn = page.locator("button[type='submit'], input[type='submit'], button:has-text('ログイン')").first
+        # ログインボタンを押下
+        submit_btn = page.locator("input[type='submit'], button[type='submit'], button:has-text('ログイン')").first
         print("・ログインボタンを押下...")
         submit_btn.click()
         
-        # ログイン完了待機（管理画面への遷移）
+        # ページ遷移待機
         try:
-            page.wait_for_selector("text='店舗を選択'", timeout=15000)
-            print("・店舗選択画面を確認しました。")
+            page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
-            page.wait_for_timeout(7000)
+            page.wait_for_timeout(5000)
     else:
-        print("[WARNING] ログインフォームの入力欄が見つかりませんでした。")
+        print("・すでにログイン済みか、フォームが見当たりません。次へ進みます。")
 
 def select_store(page, store_name, is_first_store=False):
     print(f"\n--- 【店舗切り替え】「{store_name}」へ移動 ---")
     page.wait_for_timeout(2000)
 
-    # 初回店舗選択モーダルまたは一覧
-    if page.locator("text='利用する店舗を選択'").is_visible() or page.locator("text='店舗を選択'").is_visible():
+    # 利用店舗選択画面
+    if page.locator("text='利用する店舗を選択'").first.is_visible() or page.locator("text='店舗を選択'").first.is_visible():
         page.wait_for_selector(f"text='{store_name}'", timeout=15000)
         page.locator(f"text='{store_name}'").first.click()
         page.wait_for_timeout(4000)
@@ -216,10 +193,18 @@ def main():
             pass
 
     with sync_playwright() as p:
+        # ヘッドレス検知・Cookie制限を防ぐUser-Agentを設定
+        user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         context = p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+            user_agent=user_agent,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-blink-features=AutomationControlled"
+            ]
         )
         page = context.new_page()
 
