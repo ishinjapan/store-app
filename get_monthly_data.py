@@ -164,7 +164,7 @@ def main():
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
-            headless=False,
+            headless=True,
             args=["--start-maximized"]
         )
         page = context.new_page()
