@@ -22,6 +22,74 @@ TARGET_STORES = [
     "おにぎり維心 中目黒店"
 ]
 
+def close_all_popups(page):
+    """AirMATEや各種お知らせポップアップを安全に閉じる・強制消去する"""
+    page.wait_for_timeout(500)
+
+    # 1. AirMATEやモーダルダイアログ内の「✕」「閉じる」ボタンをクリック
+    close_selectors = [
+        "button[aria-label='閉じる']",
+        "button[aria-label='close' i]",
+        "button:has-text('✕')",
+        "button:has-text('×')",
+        "button:has-text('閉じる')",
+        "a:has-text('閉じる')",
+        "[role='dialog'] button",
+        "div[class*='modal' i] button",
+        "div[class*='Modal' i] button",
+        "div[class*='dialog' i] button",
+        "button[class*='close' i]",
+        "[class*='Close' i]"
+    ]
+    for sel in close_selectors:
+        try:
+            btn = page.locator(sel).first
+            if btn.is_visible(timeout=400):
+                btn.click(timeout=1000)
+                page.wait_for_timeout(800)
+                print("・AirMATE / お知らせポップアップを閉じました。")
+                return
+        except Exception:
+            pass
+
+    # 2. Escapeキーを送信してモーダルを閉じる
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_timeout(400)
+    except Exception:
+        pass
+
+    # 3. それでも残っている場合、JSでモーダルとオーバーレイ（黒い背景幕）を安全に強制消去
+    try:
+        removed = page.evaluate("""() => {
+            let found = false;
+            const selectors = [
+                '[role="dialog"]',
+                '[class*="modal" i]',
+                '[class*="dialog" i]',
+                '[class*="overlay" i]'
+            ];
+            for (const s of selectors) {
+                document.querySelectorAll(s).forEach(el => {
+                    // 店舗選択画面など業務に必要な画面は消さない
+                    if (el.innerText && (el.innerText.includes('利用する店舗を選択') || el.innerText.includes('店舗を選択'))) {
+                        return;
+                    }
+                    const rect = el.getBoundingClientRect();
+                    if (rect.width > 150 && rect.height > 150) {
+                        el.remove();
+                        found = true;
+                    }
+                });
+            }
+            return found;
+        }""")
+        if removed:
+            print("・ポップアップ要素を強制消去しました。")
+            page.wait_for_timeout(500)
+    except Exception:
+        pass
+
 def auto_login(page):
     if not AIRREGI_ID or not AIRREGI_PASS:
         print("[WARNING] AIRREGI_ID または AIRREGI_PASS が未設定です。")
@@ -55,33 +123,35 @@ def auto_login(page):
         pass_input.fill(AIRREGI_PASS)
         page.wait_for_timeout(500)
 
-        # ログインボタンを押下
         submit_btn = page.locator("input[type='submit'], button[type='submit'], button:has-text('ログイン')").first
         print("・ログインボタンを押下...")
         submit_btn.click()
         
-        # ページ遷移待機
         try:
             page.wait_for_load_state("networkidle", timeout=15000)
         except Exception:
             page.wait_for_timeout(5000)
-    else:
-        print("・すでにログイン済みか、フォームが見当たりません。次へ進みます。")
+
+    # ログイン直後のポップアップ消去
+    close_all_popups(page)
 
 def select_store(page, store_name, is_first_store=False):
     print(f"\n--- 【店舗切り替え】「{store_name}」へ移動 ---")
-    page.wait_for_timeout(2000)
+    page.wait_for_timeout(1500)
+    close_all_popups(page)
 
     # 利用店舗選択画面
     if page.locator("text='利用する店舗を選択'").first.is_visible() or page.locator("text='店舗を選択'").first.is_visible():
         page.wait_for_selector(f"text='{store_name}'", timeout=15000)
         page.locator(f"text='{store_name}'").first.click()
         page.wait_for_timeout(4000)
+        close_all_popups(page)
         return
 
     if is_first_store:
         try:
             page.wait_for_selector(f"text='{store_name}'", timeout=5000)
+            close_all_popups(page)
             return
         except Exception:
             pass
@@ -97,8 +167,10 @@ def select_store(page, store_name, is_first_store=False):
     page.wait_for_timeout(2000)
     page.locator(f"text='{store_name}'").first.click()
     page.wait_for_timeout(3500)
+    close_all_popups(page)
 
 def navigate_to_sales_page(page):
+    close_all_popups(page)
     sales_menu = page.locator("text='売上・分析'").first
     page.wait_for_selector("text='売上・分析'", timeout=15000)
     if not page.locator("text='日別売上'").first.is_visible():
@@ -107,6 +179,7 @@ def navigate_to_sales_page(page):
     page.wait_for_selector("text='日別売上'", timeout=15000)
     page.locator("text='日別売上'").first.click()
     page.wait_for_timeout(2500)
+    close_all_popups(page)
 
 def extract_sales_for_date(page, target_date):
     dt = datetime.strptime(target_date, "%Y-%m-%d")
@@ -114,6 +187,7 @@ def extract_sales_for_date(page, target_date):
     day_num_str = f"{dt.day}日"
 
     print(f"・ {target_date} ({year_str} {month_str} {day_num_str}) のデータを指定中...")
+    close_all_popups(page)
 
     try:
         page.evaluate("""() => {
@@ -193,7 +267,6 @@ def main():
             pass
 
     with sync_playwright() as p:
-        # ヘッドレス検知・Cookie制限を防ぐUser-Agentを設定
         user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
         context = p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
