@@ -165,7 +165,7 @@ def main():
         context = p.chromium.launch_persistent_context(
             user_data_dir=USER_DATA_DIR,
             headless=True,
-            args=["--start-maximized"]
+           args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
         )
         page = context.new_page()
 
