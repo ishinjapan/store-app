@@ -439,7 +439,7 @@ display_year = st.session_state["display_year"]
 months_in_year = [m for m in available_months if m.startswith(display_year)] or [f"{display_year}-01"]
 st.sidebar.selectbox("対象月", months_in_year, key="selected_year_month")
 
-# --- 売上データ取得ブロック（実行ログを画面に出力する構成） ---
+# --- 売上データ取得ブロック（環境変数を明示的に子プロセスへ引き渡す） ---
 with st.sidebar.expander("📥 売上データを取得する"):
     target_date = st.date_input("取得日", value=datetime.now().date(), key="fetch_date_input_sidebar")
     if st.button("🚀 取得実行", type="primary"):
@@ -453,18 +453,26 @@ with st.sidebar.expander("📥 売上データを取得する"):
                     check=True
                 )
                 
-                # データ取得スクリプト実行
+                # StreamlitのSecretsから環境変数を引き継ぐ
+                custom_env = os.environ.copy()
+                if "AIRREGI_ID" in st.secrets:
+                    custom_env["AIRREGI_ID"] = str(st.secrets["AIRREGI_ID"])
+                if "AIRREGI_PASS" in st.secrets:
+                    custom_env["AIRREGI_PASS"] = str(st.secrets["AIRREGI_PASS"])
+
+                # データ取得スクリプト実行（envを指定）
                 res = subprocess.run(
                     [sys.executable, "get_monthly_data.py", target_str, target_str],
                     capture_output=True,
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    env=custom_env,
                     check=True
                 )
                 st.success("🎉 取得処理が完了しました")
                 
-                # 実行ログをアコーディオンで常時確認可能にする
+                # 実行ログ表示
                 with st.expander("📄 実行ログ（標準出力 / エラー）", expanded=True):
                     if res.stdout:
                         st.markdown("**【標準出力】**")
@@ -473,7 +481,6 @@ with st.sidebar.expander("📥 売上データを取得する"):
                         st.markdown("**【標準エラー】**")
                         st.code(res.stderr, language="text")
                     
-                    # outputフォルダ内のCSVファイル確認
                     created_files = glob.glob(os.path.join(OUTPUT_DIR, "*.csv"))
                     st.markdown(f"**現在のCSV保存件数**: {len(created_files)} 件")
                     if created_files:
@@ -489,6 +496,10 @@ with st.sidebar.expander("📥 売上データを取得する"):
                 if e.stdout:
                     err_detail += f"【標準出力】:\n{e.stdout}"
                 st.code(err_detail if err_detail else "エラーメッセージはありませんでした。", language="text")
+                
+                # エラー発生時の画面スクリーンショットがあれば表示
+                if os.path.exists("error_screenshot.png"):
+                    st.image("error_screenshot.png", caption="エラー発生時のブラウザ画面")
 
 st.sidebar.markdown("---")
 app_mode = st.sidebar.radio("機能を選択してください", ["📊 本部用（月報一覧表示）", "📱 店舗用（実績入力）", "📋 エクセルコピペ用データ生成", "📄 報告書作成"])
