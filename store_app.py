@@ -67,7 +67,7 @@ def match_slot_row(store_df, slot_name):
     short_slot = slot_name[0] if slot_name else ""
     return store_df[store_df[1].astype(str).str.contains(short_slot, na=False)]
 
-# --- キャッシュ付きデータロード関数群（ttlを600秒に延ばしてAPI消費と再読み込みを削減） ---
+# --- キャッシュ付きデータロード関数群 ---
 @st.cache_data(ttl=600)
 def load_budget_prev_data():
     try:
@@ -76,7 +76,7 @@ def load_budget_prev_data():
             df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
         return df
     except Exception:
-        return pd.DataFrame(columns=["date", "store", "time_slot", "budget_sales", "prev_sales", "prev_cust"])
+        return pd.DataFrame(columns=["date", "store", "time_slot", "budget_sales", "prev_sales", "prev_cust", "budget_cust"])
 
 @st.cache_data(ttl=600)
 def load_delivery_data():
@@ -201,7 +201,6 @@ def find_airregi_data_in_memory(date_str, df_year):
             sub_data.columns = range(sub_data.shape[1])
             return sub_data
 
-    # フォールバックとしてローカルCSV探索
     d_dash = date_str
     d_nodash = date_str.replace("-", "")
     d_under = date_str.replace("-", "_")
@@ -299,22 +298,30 @@ def delete_reservation_sale(sale_id):
     conn.update(worksheet="reservation_sales", data=df)
     load_reservation_sales.clear()
 
-# --- 高速化版 表生成関数（事前グルーピング・辞書化によりO(1)アクセス） ---
+# --- 表生成関数（予算客数・客数予算比・予算単価・単価予算比を追加） ---
 def generate_month_df(selected_store, year, month, target_slot_keyword, bp_df, deliv_df, res_df, res_sales_df, airregi_df):
     _, max_days = calendar.monthrange(year, month)
 
-    # 1. 予算・前年データの事前辞書化
+    # 1. 予算・前年データの事前辞書化（budget_cust / 予算客数の自動検出）
     bp_dict = {}
     if not bp_df.empty:
         bp_sub = bp_df[bp_df["store"] == selected_store]
         if target_slot_keyword and not bp_sub.empty:
             bp_sub = bp_sub[bp_sub["time_slot"] == target_slot_keyword]
         if not bp_sub.empty:
+            b_cust_col = None
+            for c in ["budget_cust", "予算客数", "b_cust", "budget_customers"]:
+                if c in bp_sub.columns:
+                    b_cust_col = c
+                    break
+
             for d, grp in bp_sub.groupby("date"):
+                b_cust_val = parse_int(grp[b_cust_col].sum()) if b_cust_col else 0
                 bp_dict[str(d).strip()] = {
                     "prev_sales": parse_int(grp["prev_sales"].sum()),
                     "budget_sales": parse_int(grp["budget_sales"].sum()),
-                    "prev_cust": parse_int(grp["prev_cust"].sum())
+                    "prev_cust": parse_int(grp["prev_cust"].sum()),
+                    "budget_cust": b_cust_val
                 }
 
     # 2. デリバリー売上の事前辞書化
@@ -393,6 +400,7 @@ def generate_month_df(selected_store, year, month, target_slot_keyword, bp_df, d
         p_sales = bp_item.get("prev_sales", 0)
         b_sales = bp_item.get("budget_sales", 0)
         p_cust = bp_item.get("prev_cust", 0)
+        b_cust = bp_item.get("budget_cust", 0)
 
         air_sales, air_cust, air_other_sales = 0, 0, 0
         if date_str in air_dict:
@@ -423,19 +431,31 @@ def generate_month_df(selected_store, year, month, target_slot_keyword, bp_df, d
         actual_sales = adjusted_air_sales + day_delivery_sales + total_other_sales
         actual_cust = air_cust
 
+        # 売上比率
         prev_ratio = f"{(actual_sales / p_sales * 100):.1f}%" if p_sales > 0 and actual_sales != 0 else ("-" if actual_sales == 0 else "0.0%")
         budget_ratio = f"{(actual_sales / b_sales * 100):.1f}%" if b_sales > 0 and actual_sales != 0 else ("-" if actual_sales == 0 else "0.0%")
+
+        # 単価計算
         p_price = int(p_sales / p_cust) if p_cust > 0 else 0
+        b_price = int(b_sales / b_cust) if b_cust > 0 else 0
         a_price = int(actual_sales / actual_cust) if actual_cust > 0 else 0
-        cust_ratio = f"{(actual_cust / p_cust * 100):.1f}%" if p_cust > 0 and actual_cust > 0 else "-"
-        price_ratio = f"{(a_price / p_price * 100):.1f}%" if p_price > 0 and a_price != 0 else "-"
+
+        # 稼働（客数）比率
+        cust_prev_ratio = f"{(actual_cust / p_cust * 100):.1f}%" if p_cust > 0 and actual_cust > 0 else "-"
+        cust_budget_ratio = f"{(actual_cust / b_cust * 100):.1f}%" if b_cust > 0 and actual_cust > 0 else "-"
+
+        # 客単価比率
+        price_prev_ratio = f"{(a_price / p_price * 100):.1f}%" if p_price > 0 and a_price != 0 else "-"
+        price_budget_ratio = f"{(a_price / b_price * 100):.1f}%" if b_price > 0 and a_price != 0 else "-"
+
         weekday_kanji = weekday_kanji_list[pd.to_datetime(date_str).weekday()]
 
         rows.append({
             "日": day, "曜日": weekday_kanji, "前年売上": p_sales, "予算売上": b_sales, "実績売上": actual_sales,
             "前年比": prev_ratio, "予算比": budget_ratio, "店頭売上": adjusted_air_sales, "デリバリー売上": day_delivery_sales,
             "その他売上": total_other_sales, "予約金": day_res_deposit, "売上計上": day_res_sales,
-            "前年客数": p_cust, "実績客数": actual_cust, "客数前年比": cust_ratio, "前年単価": p_price, "実績単価": a_price, "単価前年比": price_ratio
+            "前年客数": p_cust, "予算客数": b_cust, "実績客数": actual_cust, "客数前年比": cust_prev_ratio, "客数予算比": cust_budget_ratio,
+            "前年単価": p_price, "予算単価": b_price, "実績単価": a_price, "単価前年比": price_prev_ratio, "単価予算比": price_budget_ratio
         })
 
     return pd.DataFrame(rows)
@@ -443,43 +463,83 @@ def generate_month_df(selected_store, year, month, target_slot_keyword, bp_df, d
 def calculate_summary_rows(df_slot):
     df_act = df_slot[df_slot["実績売上"] != 0]
     if df_act.empty: df_act = df_slot.iloc[:1]
-    num_cols = ["前年売上", "予算売上", "実績売上", "店頭売上", "デリバリー売上", "その他売上", "予約金", "売上計上", "前年客数", "実績客数"]
+    num_cols = ["前年売上", "予算売上", "実績売上", "店頭売上", "デリバリー売上", "その他売上", "予約金", "売上計上", "前年客数", "予算客数", "実績客数"]
 
+    # 合計
     sum_vals = {col: int(pd.to_numeric(df_act[col], errors="coerce").fillna(0).sum()) for col in num_cols}
     s_p_ratio = f"{(sum_vals['実績売上'] / sum_vals['前年売上'] * 100):.1f}%" if sum_vals['前年売上'] > 0 else "-"
     s_b_ratio = f"{(sum_vals['実績売上'] / sum_vals['予算売上'] * 100):.1f}%" if sum_vals['予算売上'] > 0 else "-"
     s_c_ratio = f"{(sum_vals['実績客数'] / sum_vals['前年客数'] * 100):.1f}%" if sum_vals['前年客数'] > 0 else "-"
+    s_cb_ratio = f"{(sum_vals['実績客数'] / sum_vals['予算客数'] * 100):.1f}%" if sum_vals['予算客数'] > 0 else "-"
     s_p_price = int(sum_vals['前年売上'] / sum_vals['前年客数']) if sum_vals['前年客数'] > 0 else 0
+    s_b_price = int(sum_vals['予算売上'] / sum_vals['予算客数']) if sum_vals['予算客数'] > 0 else 0
     s_a_price = int(sum_vals['実績売上'] / sum_vals['実績客数']) if sum_vals['実績客数'] > 0 else 0
     s_pr_ratio = f"{(s_a_price / s_p_price * 100):.1f}%" if s_p_price > 0 else "-"
-    row_sum = {"日": "合計", "曜日": "", **sum_vals, "前年比": s_p_ratio, "予算比": s_b_ratio, "客数前年比": s_c_ratio, "前年単価": s_p_price, "実績単価": s_a_price, "単価前年比": s_pr_ratio}
+    s_prb_ratio = f"{(s_a_price / s_b_price * 100):.1f}%" if s_b_price > 0 else "-"
+    row_sum = {
+        "日": "合計", "曜日": "", **sum_vals,
+        "前年比": s_p_ratio, "予算比": s_b_ratio,
+        "客数前年比": s_c_ratio, "客数予算比": s_cb_ratio,
+        "前年単価": s_p_price, "予算単価": s_b_price, "実績単価": s_a_price,
+        "単価前年比": s_pr_ratio, "単価予算比": s_prb_ratio
+    }
 
+    # 平均
     ave_vals = {col: int(pd.to_numeric(df_act[col], errors="coerce").fillna(0).mean()) for col in num_cols}
     a_p_ratio = f"{(ave_vals['実績売上'] / ave_vals['前年売上'] * 100):.1f}%" if ave_vals['前年売上'] > 0 else "-"
     a_b_ratio = f"{(ave_vals['実績売上'] / ave_vals['予算売上'] * 100):.1f}%" if ave_vals['予算売上'] > 0 else "-"
     a_c_ratio = f"{(ave_vals['実績客数'] / ave_vals['前年客数'] * 100):.1f}%" if ave_vals['前年客数'] > 0 else "-"
+    a_cb_ratio = f"{(ave_vals['実績客数'] / ave_vals['予算客数'] * 100):.1f}%" if ave_vals['予算客数'] > 0 else "-"
     a_p_price = int(ave_vals['前年売上'] / ave_vals['前年客数']) if ave_vals['前年客数'] > 0 else 0
+    a_b_price = int(ave_vals['予算売上'] / ave_vals['予算客数']) if ave_vals['予算客数'] > 0 else 0
     a_a_price = int(ave_vals['実績売上'] / ave_vals['実績客数']) if ave_vals['実績客数'] > 0 else 0
     a_pr_ratio = f"{(a_a_price / a_p_price * 100):.1f}%" if a_p_price > 0 else "-"
-    row_ave = {"日": "AVE", "曜日": "", **ave_vals, "前年比": a_p_ratio, "予算比": a_b_ratio, "客数前年比": a_c_ratio, "前年単価": a_p_price, "実績単価": a_a_price, "単価前年比": a_pr_ratio}
+    a_prb_ratio = f"{(a_a_price / a_b_price * 100):.1f}%" if a_b_price > 0 else "-"
+    row_ave = {
+        "日": "AVE", "曜日": "", **ave_vals,
+        "前年比": a_p_ratio, "予算比": a_b_ratio,
+        "客数前年比": a_c_ratio, "客数予算比": a_cb_ratio,
+        "前年単価": a_p_price, "予算単価": a_b_price, "実績単価": a_a_price,
+        "単価前年比": a_pr_ratio, "単価予算比": a_prb_ratio
+    }
 
+    # 最小
     min_vals = {col: int(pd.to_numeric(df_act[col], errors="coerce").fillna(0).min()) for col in num_cols}
     m_p_ratio = f"{(min_vals['実績売上'] / min_vals['前年売上'] * 100):.1f}%" if min_vals['前年売上'] > 0 else "-"
     m_b_ratio = f"{(min_vals['実績売上'] / min_vals['予算売上'] * 100):.1f}%" if min_vals['予算売上'] > 0 else "-"
     m_c_ratio = f"{(min_vals['実績客数'] / min_vals['前年客数'] * 100):.1f}%" if min_vals['前年客数'] > 0 else "-"
+    m_cb_ratio = f"{(min_vals['実績客数'] / min_vals['予算客数'] * 100):.1f}%" if min_vals['予算客数'] > 0 else "-"
     m_p_price = int(pd.to_numeric(df_act["前年単価"], errors="coerce").fillna(0).min())
+    m_b_price = int(pd.to_numeric(df_act["予算単価"], errors="coerce").fillna(0).min())
     m_a_price = int(pd.to_numeric(df_act["実績単価"], errors="coerce").fillna(0).min())
     m_pr_ratio = f"{(m_a_price / m_p_price * 100):.1f}%" if m_p_price > 0 else "-"
-    row_min = {"日": "MIN", "曜日": "", **min_vals, "前年比": m_p_ratio, "予算比": m_b_ratio, "客数前年比": m_c_ratio, "前年単価": m_p_price, "実績単価": m_a_price, "単価前年比": m_pr_ratio}
+    m_prb_ratio = f"{(m_a_price / m_b_price * 100):.1f}%" if m_b_price > 0 else "-"
+    row_min = {
+        "日": "MIN", "曜日": "", **min_vals,
+        "前年比": m_p_ratio, "予算比": m_b_ratio,
+        "客数前年比": m_c_ratio, "客数予算比": m_cb_ratio,
+        "前年単価": m_p_price, "予算単価": m_b_price, "実績単価": m_a_price,
+        "単価前年比": m_pr_ratio, "単価予算比": m_prb_ratio
+    }
 
+    # 最大
     max_vals = {col: int(pd.to_numeric(df_act[col], errors="coerce").fillna(0).max()) for col in num_cols}
     mx_p_ratio = f"{(max_vals['実績売上'] / max_vals['前年売上'] * 100):.1f}%" if max_vals['前年売上'] > 0 else "-"
     mx_b_ratio = f"{(max_vals['実績売上'] / max_vals['予算売上'] * 100):.1f}%" if max_vals['予算売上'] > 0 else "-"
     mx_c_ratio = f"{(max_vals['実績客数'] / max_vals['前年客数'] * 100):.1f}%" if max_vals['前年客数'] > 0 else "-"
+    mx_cb_ratio = f"{(max_vals['実績客数'] / max_vals['予算客数'] * 100):.1f}%" if max_vals['予算客数'] > 0 else "-"
     mx_p_price = int(pd.to_numeric(df_act["前年単価"], errors="coerce").fillna(0).max())
+    mx_b_price = int(pd.to_numeric(df_act["予算単価"], errors="coerce").fillna(0).max())
     mx_a_price = int(pd.to_numeric(df_act["実績単価"], errors="coerce").fillna(0).max())
     mx_pr_ratio = f"{(mx_a_price / mx_p_price * 100):.1f}%" if mx_p_price > 0 else "-"
-    row_max = {"日": "MAX", "曜日": "", **max_vals, "前年比": mx_p_ratio, "予算比": mx_b_ratio, "客数前年比": mx_c_ratio, "前年単価": mx_p_price, "実績単価": mx_a_price, "単価前年比": mx_pr_ratio}
+    mx_prb_ratio = f"{(mx_a_price / mx_b_price * 100):.1f}%" if mx_b_price > 0 else "-"
+    row_max = {
+        "日": "MAX", "曜日": "", **max_vals,
+        "前年比": mx_p_ratio, "予算比": mx_b_ratio,
+        "客数前年比": mx_c_ratio, "客数予算比": mx_cb_ratio,
+        "前年単価": mx_p_price, "予算単価": mx_b_price, "実績単価": mx_a_price,
+        "単価前年比": mx_pr_ratio, "単価予算比": mx_prb_ratio
+    }
 
     return [row_sum, row_ave, row_min, row_max]
 
@@ -661,7 +721,7 @@ selected_store = st.session_state["selected_store"]
 selected_year_month = st.session_state["selected_year_month"]
 year, month = map(int, selected_year_month.split("-"))
 
-# 画面全体で使う共通データを1回だけロード
+# 共通データの取得
 bp_df = load_budget_prev_data()
 deliv_df = load_delivery_data()
 res_df = load_reservations()
@@ -1100,7 +1160,7 @@ else:
             return f"-¥{abs(num):,}" if num < 0 else f"¥{num:,}" if num > 0 else "¥0"
         except: return str(val)
 
-    # 全体サマリー用（高速化された generate_month_df を使用）
+    # 全体サマリー用
     df_month_total = generate_month_df(selected_store, year, month, None, bp_df, deliv_df, res_df, res_sales_df, airregi_year_df)
     df_achieved = df_month_total[df_month_total["実績売上"] != 0]
     if df_achieved.empty: max_day, df_achieved = 1, df_month_total.iloc[:1]
@@ -1109,21 +1169,28 @@ else:
     t_p, t_b, t_act = df_achieved["前年売上"].sum(), df_achieved["予算売上"].sum(), df_achieved["実績売上"].sum()
     t_air, t_del, t_oth = df_achieved["店頭売上"].sum(), df_achieved["デリバリー売上"].sum(), df_achieved["その他売上"].sum()
     t_res_dep, t_res_sales = df_achieved["予約金"].sum(), df_achieved["売上計上"].sum()
-    t_pc, t_ac = df_achieved["前年客数"].sum(), df_achieved["実績客数"].sum()
+    t_pc, t_bc, t_ac = df_achieved["前年客数"].sum(), df_achieved["予算客数"].sum(), df_achieved["実績客数"].sum()
 
     tot_pprice = int(t_p / t_pc) if t_pc > 0 else 0
+    tot_bprice = int(t_b / t_bc) if t_bc > 0 else 0
     tot_aprice = int(t_act / t_ac) if t_ac > 0 else 0
+
     p_ratio_str = f"{(t_act / t_p * 100):.1f}%" if t_p > 0 else "-"
     b_ratio_str = f"{(t_act / t_b * 100):.1f}%" if t_b > 0 else "-"
     cust_ratio_str = f"{(t_ac / t_pc * 100):.1f}%" if t_pc > 0 else "-"
+    cust_budget_ratio_str = f"{(t_ac / t_bc * 100):.1f}%" if t_bc > 0 else "-"
     price_ratio_str = f"{(tot_aprice / tot_pprice * 100):.1f}%" if tot_pprice > 0 else "-"
+    price_budget_ratio_str = f"{(tot_aprice / tot_bprice * 100):.1f}%" if tot_bprice > 0 else "-"
 
     summary_data = [{
         "日": f"{max_day}日時点", "曜日": "合計", "前年比": p_ratio_str, "予算比": b_ratio_str,
         "前年売上": format_currency(t_p), "予算売上": format_currency(t_b), "実績売上": format_currency(t_act),
         "店頭売上": format_currency(t_air), "デリバリー売上": format_currency(t_del), "その他売上": format_currency(t_oth),
         "予約金": format_currency(t_res_dep), "売上計上": format_currency(t_res_sales),
-        "前年客数": int(t_pc), "実績客数": int(t_ac), "客数前年比": cust_ratio_str, "前年単価": format_currency(tot_pprice), "実績単価": format_currency(tot_aprice), "単価前年比": price_ratio_str
+        "前年客数": int(t_pc), "予算客数": int(t_bc), "実績客数": int(t_ac),
+        "客数前年比": cust_ratio_str, "客数予算比": cust_budget_ratio_str,
+        "前年単価": format_currency(tot_pprice), "予算単価": format_currency(tot_bprice), "実績単価": format_currency(tot_aprice),
+        "単価前年比": price_ratio_str, "単価予算比": price_budget_ratio_str
     }]
 
     def render_styled_html_table(df, is_summary=False):
@@ -1136,14 +1203,13 @@ else:
             html += f'<th style="position: sticky; top: 0; background-color: {header_bg}; color: {header_color}; border: 1px solid #e0e0e0; padding: 8px; font-weight: bold; z-index: 1;">{col}</th>'
         html += "</tr></thead><tbody>"
 
-        # to_dict(orient="records") を用いて高速走査
         for idx, row in enumerate(df.to_dict(orient="records")):
             bg_color = "#fffbf0" if idx % 2 == 0 else "#ffffff"
             html += f'<tr style="background-color: {bg_color}; text-align: center;">'
             for col in cols:
                 val = str(row[col])
                 style = "border: 1px solid #e0e0e0; padding: 8px; white-space: nowrap;"
-                if col in ["前年比", "予算比", "客数前年比", "単価前年比"] or "%" in val:
+                if col in ["前年比", "予算比", "客数前年比", "客数予算比", "単価前年比", "単価予算比"] or "%" in val:
                     if "%" in val:
                         try:
                             num = float(val.replace("%", "").strip())
@@ -1151,7 +1217,8 @@ else:
                         except Exception: style += " font-weight: bold;"
                     else: style += " font-weight: bold;"
                 elif "-" in val and any(char.isdigit() for char in val): style += " color: #c0392b; font-weight: bold;"
-                elif col in ["前年売上", "予算売上", "実績売上", "店頭売上", "デリバリー売上", "その他売上", "予約金", "売上計上", "前年単価", "実績単価"] or is_summary: style += " font-weight: bold;"
+                elif col in ["前年売上", "予算売上", "実績売上", "店頭売上", "デリバリー売上", "その他売上", "予約金", "売上計上", "前年単価", "予算単価", "実績単価"] or is_summary:
+                    style += " font-weight: bold;"
                 html += f'<td style="{style}">{val}</td>'
             html += "</tr>"
         return html + "</tbody></table></div>"
@@ -1169,7 +1236,7 @@ else:
 
     df_current_slot = generate_month_df(selected_store, year, month, current_kw, bp_df, deliv_df, res_df, res_sales_df, airregi_year_df)
     df_current_slot_formatted = df_current_slot.copy()
-    for col in ["前年売上", "予算売上", "実績売上", "店頭売上", "デリバリー売上", "その他売上", "予約金", "売上計上", "前年単価", "実績単価"]:
+    for col in ["前年売上", "予算売上", "実績売上", "店頭売上", "デリバリー売上", "その他売上", "予約金", "売上計上", "前年単価", "予算単価", "実績単価"]:
         df_current_slot_formatted[col] = df_current_slot_formatted[col].apply(format_currency)
 
     st.markdown("---")
