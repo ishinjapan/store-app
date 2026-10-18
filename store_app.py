@@ -106,7 +106,6 @@ def load_reservation_sales():
 
 # --- Airレジ売上専用スプレッドシート（年別タブ管理） ---
 def get_airregi_sheet_for_year(year_str):
-    """指定年のタブから売上データを読み込む"""
     if not AIRREGI_SPREADSHEET_URL:
         return pd.DataFrame()
     try:
@@ -116,7 +115,7 @@ def get_airregi_sheet_for_year(year_str):
         return pd.DataFrame()
 
 def save_airregi_csv_to_sheets(target_date_str=None):
-    """outputフォルダ内のCSVを指定年のタブへ保存・同期する"""
+    """CSVを日付順ソート＆不要見出し除去してスプレッドシートに保存"""
     if not AIRREGI_SPREADSHEET_URL:
         st.warning("⚠️ AIRREGI_SPREADSHEET の設定が見つかりません。Secretsを確認してください。")
         return 0
@@ -127,7 +126,6 @@ def save_airregi_csv_to_sheets(target_date_str=None):
         if not csv_files:
             return 0
 
-        # ファイルを年ごとにグループ分け
         files_by_year = {}
         for f in csv_files:
             m = re.search(r"(\d{4})-(\d{2}-\d{2})", os.path.basename(f))
@@ -143,6 +141,12 @@ def save_airregi_csv_to_sheets(target_date_str=None):
                 try:
                     raw = pd.read_csv(f_path, header=None)
                     if raw.empty: continue
+                    
+                    # 不要な見出し行（「時間帯」「現金」）を除去
+                    if raw.shape[1] > 1:
+                        raw = raw[~raw[1].astype(str).str.strip().isin(["時間帯", "現金"])]
+                    
+                    if raw.empty: continue
                     raw.insert(0, "date", date_str)
                     raw.columns = ["date"] + [f"c{i}" for i in range(raw.shape[1] - 1)]
                     new_records.append(raw)
@@ -156,11 +160,21 @@ def save_airregi_csv_to_sheets(target_date_str=None):
             current_sheet_df = get_airregi_sheet_for_year(y_str)
 
             if not current_sheet_df.empty and "date" in current_sheet_df.columns:
+                # 既存シート内の不要行もクリーンアップ
+                if "c1" in current_sheet_df.columns:
+                    current_sheet_df = current_sheet_df[~current_sheet_df["c1"].astype(str).str.strip().isin(["時間帯", "現金"])]
+                
                 dates_to_replace = year_new_df["date"].unique()
                 kept_df = current_sheet_df[~current_sheet_df["date"].isin(dates_to_replace)]
                 final_df = pd.concat([kept_df, year_new_df], ignore_index=True)
             else:
                 final_df = year_new_df
+
+            # 日付（昇順）できれいに並べ替え
+            if "date" in final_df.columns:
+                sort_cols = ["date"]
+                if "c0" in final_df.columns: sort_cols.append("c0")
+                final_df = final_df.sort_values(by=sort_cols).reset_index(drop=True)
 
             conn.update(spreadsheet=AIRREGI_SPREADSHEET_URL, worksheet=str(y_str), data=final_df)
             total_synced_dates += len(year_new_df["date"].unique())
@@ -171,10 +185,7 @@ def save_airregi_csv_to_sheets(target_date_str=None):
         return 0
 
 def find_and_read_airregi(date_str):
-    """まず指定年のスプレッドシートタブを探索し、無ければローカルCSVを探す"""
     year_str = date_str.split("-")[0]
-    
-    # 1. スプレッドシート探索
     df_year = get_airregi_sheet_for_year(year_str)
     if not df_year.empty and "date" in df_year.columns:
         sub = df_year[df_year["date"].astype(str).str.strip() == date_str.strip()]
@@ -183,7 +194,6 @@ def find_and_read_airregi(date_str):
             sub_data.columns = range(sub_data.shape[1])
             return sub_data, f"Googleスプレッドシート (Airレジ売上 {year_str}年)"
 
-    # 2. ローカルCSV探索
     d_dash = date_str
     d_nodash = date_str.replace("-", "")
     d_under = date_str.replace("-", "_")
@@ -196,7 +206,6 @@ def find_and_read_airregi(date_str):
 
 def get_available_months():
     months = set()
-    # 表示年のスプレッドシートタブから月を収集
     display_year = st.session_state.get("display_year", str(datetime.now().year))
     df_cur_year = get_airregi_sheet_for_year(display_year)
     if not df_cur_year.empty and "date" in df_cur_year.columns:
@@ -204,7 +213,6 @@ def get_available_months():
             m = re.search(r"(\d{4})-(\d{2})", d)
             if m: months.add(f"{m.group(1)}-{m.group(2)}")
 
-    # ローカルCSVからも収集
     all_files = glob.glob(os.path.join(OUTPUT_DIR, "*.csv"))
     for f in all_files:
         base = os.path.basename(f)
@@ -476,7 +484,6 @@ def create_multi_sheet_excel(selected_store, year, month, bp_df, deliv_df, res_d
         if "Sheet" in workbook.sheetnames: workbook.remove(workbook["Sheet"])
     return output.getvalue()
 
-# 利用可能な年一覧
 current_year_num = datetime.now().year
 available_years = [str(y) for y in range(current_year_num, current_year_num - 11, -1)]
 
@@ -535,10 +542,8 @@ with st.sidebar.expander("📥 売上データを取得する"):
                 air_id = None
                 air_pass = None
 
-                if "AIRREGI_ID" in st.secrets:
-                    air_id = st.secrets["AIRREGI_ID"]
-                if "AIRREGI_PASS" in st.secrets:
-                    air_pass = st.secrets["AIRREGI_PASS"]
+                if "AIRREGI_ID" in st.secrets: air_id = st.secrets["AIRREGI_ID"]
+                if "AIRREGI_PASS" in st.secrets: air_pass = st.secrets["AIRREGI_PASS"]
 
                 if not air_id and "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
                     gsheets_sec = st.secrets["connections"]["gsheets"]
@@ -558,7 +563,6 @@ with st.sidebar.expander("📥 売上データを取得する"):
                     check=True
                 )
                 
-                # スプレッドシートの年別タブへ自動保存
                 n = save_airregi_csv_to_sheets(target_str)
                 st.success(f"🎉 取得＆スプレッドシートへ保存完了！（{target_str}）")
                 st.rerun()
@@ -572,7 +576,6 @@ with st.sidebar.expander("📥 売上データを取得する"):
                 if os.path.exists("error_screenshot.png"):
                     st.image("error_screenshot.png", caption="エラー発生時のブラウザ画面")
 
-    # 過去CSV一括同期ボタン
     if st.button("☁️ 取得済みCSVを年別シートに全同期", help="サーバー上にある全CSVを年ごとのシートに自動で振り分けて保存します"):
         with st.spinner("スプレッドシートへ同期中..."):
             n = save_airregi_csv_to_sheets()
