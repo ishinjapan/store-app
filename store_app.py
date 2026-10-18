@@ -526,9 +526,28 @@ def generate_month_df(
   # 1. 予算・前年・過去実績データの事前辞書化
   bp_dict = {}
   if not bp_df.empty:
-    bp_sub = bp_df[bp_df["store"] == selected_store]
+    # 対象店舗のみ抽出
+    bp_sub = bp_df[bp_df["store"] == selected_store].copy()
+
+    # ★ここを追加：日付の表記ゆれ（2026/8/1 と 2026-08-01 など）を完全に統一
+    def fix_date_format(val):
+      m = re.search(r"(\d{4})[^\d](\d{1,2})[^\d](\d{1,2})", str(val))
+      if m:
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+      return str(val).strip()
+
+    if "date" in bp_sub.columns:
+      bp_sub["date"] = bp_sub["date"].apply(fix_date_format)
+
+    # ★ここを追加：日付とシフトの重複行をここで確実に1件に圧縮（10倍膨張を防止）
+    if {"date", "time_slot"}.issubset(bp_sub.columns):
+      bp_sub = bp_sub.drop_duplicates(
+          subset=["date", "time_slot"], keep="first"
+      )
+
     if target_slot_keyword and not bp_sub.empty:
       bp_sub = bp_sub[bp_sub["time_slot"] == target_slot_keyword]
+
     if not bp_sub.empty:
       b_cust_col = None
       for c in ["budget_cust", "予算客数", "b_cust", "budget_customers"]:
