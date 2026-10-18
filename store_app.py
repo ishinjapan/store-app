@@ -286,9 +286,9 @@ def delete_reservation_sale(sale_id):
 
 def parse_int(val):
     if pd.isna(val): return 0
-    clean_str = re.sub(r"[^\d-]", "", str(val))
-    try: return int(clean_str)
-    except ValueError: return 0
+    clean_str = re.sub(r"[^\d.-]", "", str(val))
+    try: return int(float(clean_str))
+    except (ValueError, OverflowError): return 0
 
 def get_short_store_key(store_name):
     for key in ["三田", "恵比寿", "五反田", "中目黒"]:
