@@ -67,19 +67,43 @@ def match_slot_row(store_df, slot_name):
     short_slot = slot_name[0] if slot_name else ""
     return store_df[store_df[1].astype(str).str.contains(short_slot, na=False)]
 
-# --- キャッシュ付きデータロード関数群（重複行の自動排除を追加） ---
+# --- キャッシュ付きデータロード関数群 ---
 @st.cache_data(ttl=600)
 def load_budget_prev_data():
     try:
         df = conn.read(worksheet="budget_prev", ttl=0).dropna(how="all")
         if not df.empty:
-            df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
-            df["date"] = df["date"].astype(str).str.strip()
-            # 💡【重要】スプレッドシート上の同一日・店舗・シフトの重複行を自動排除（上部データを優先）
-            df = df.drop_duplicates(subset=["date", "store", "time_slot"], keep="first")
+            # 1. 列名の前後の空白文字をすべて完全に除去
+            df.columns = [str(c).strip() for c in df.columns]
+
+            # 2. シフト名の正規化
+            if "time_slot" in df.columns:
+                df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
+
+            # 3. ★ここが最重要：スプレッドシートの「2026/10/1」などを「2026-10-01」に強制変換して統一
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
+
+            if "store" in df.columns:
+                df["store"] = df["store"].astype(str).str.strip()
+
+            # 4. 日付・店舗・シフトが同じ行を1件だけに絞り込む
+            target_sub = [
+                c for c in ["date", "store", "time_slot"] if c in df.columns
+            ]
+            if target_sub:
+                df = df.drop_duplicates(subset=target_sub, keep="first")
+
         return df
-    except Exception:
-        return pd.DataFrame(columns=["date", "store", "time_slot", "budget_sales", "prev_sales", "prev_cust", "budget_cust"])
+    except Exception as e:
+        # 万が一エラーが起きた場合は画面に赤文字でエラー理由を表示する
+        st.error(f"スプレッドシートの読み込みエラー: {e}")
+        return pd.DataFrame(
+            columns=[
+                "date", "store", "time_slot", "budget_sales", "prev_sales",
+                "prev_cust", "budget_cust", "store_sales", "delivery_sales"
+            ]
+        )
 
 @st.cache_data(ttl=600)
 def load_delivery_data():
