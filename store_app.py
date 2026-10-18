@@ -102,6 +102,11 @@ def load_budget_prev_data():
     df = conn.read(worksheet="budget_prev", ttl=0).dropna(how="all")
     if not df.empty:
       df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
+      # ★ここを追加：日付・店舗・シフトの重複行を自動で1つにまとめる
+      if {"date", "store", "time_slot"}.issubset(df.columns):
+        df = df.drop_duplicates(
+            subset=["date", "store", "time_slot"], keep="first"
+        )
     return df
   except Exception:
     return pd.DataFrame(
