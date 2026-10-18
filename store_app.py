@@ -28,6 +28,14 @@ conn = st.connection("gsheets", type=GSheetsConnection)
 OUTPUT_DIR = os.path.abspath("./output")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
+# Airレジ専用スプレッドシートのURL取得（Secretsから）
+AIRREGI_SPREADSHEET_URL = None
+if "AIRREGI_SPREADSHEET" in st.secrets:
+    AIRREGI_SPREADSHEET_URL = str(st.secrets["AIRREGI_SPREADSHEET"])
+elif "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+    if "AIRREGI_SPREADSHEET" in st.secrets["connections"]["gsheets"]:
+        AIRREGI_SPREADSHEET_URL = str(st.secrets["connections"]["gsheets"]["AIRREGI_SPREADSHEET"])
+
 # 店舗定義
 STORE_CREDENTIALS = {
     "三田おにぎり 本店": {"id": "001", "pass": "0000", "short_label": "三田店"},
@@ -51,7 +59,7 @@ def init_data_files():
 
 init_data_files()
 
-# --- スプレッドシートからのロード関数群 ---
+# --- 予約・デリバリー用スプレッドシートからのロード関数群 ---
 def load_budget_prev_data():
     try:
         df = conn.read(worksheet="budget_prev", ttl=0).dropna(how="all")
@@ -96,72 +104,86 @@ def load_reservation_sales():
     except:
         return pd.DataFrame(columns=["id", "reservation_id", "store", "date", "time_slot", "amount"])
 
-# --- Airレジ売上データ（スプレッドシート連携） ---
-def load_airregi_data():
-    """スプレッドシートの airregi_sales シートから全データを読み込む"""
+# --- Airレジ売上専用スプレッドシート（年別タブ管理） ---
+def get_airregi_sheet_for_year(year_str):
+    """指定年のタブから売上データを読み込む"""
+    if not AIRREGI_SPREADSHEET_URL:
+        return pd.DataFrame()
     try:
-        df = conn.read(worksheet="airregi_sales", ttl=0).dropna(how="all")
+        df = conn.read(spreadsheet=AIRREGI_SPREADSHEET_URL, worksheet=str(year_str), ttl=0).dropna(how="all")
         return df if not df.empty else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
 def save_airregi_csv_to_sheets(target_date_str=None):
-    """outputフォルダ内のCSVをスプレッドシートのairregi_salesに保存・同期する"""
+    """outputフォルダ内のCSVを指定年のタブへ保存・同期する"""
+    if not AIRREGI_SPREADSHEET_URL:
+        st.warning("⚠️ AIRREGI_SPREADSHEET の設定が見つかりません。Secretsを確認してください。")
+        return 0
+
     try:
         pattern = os.path.join(OUTPUT_DIR, f"*{target_date_str}*.csv") if target_date_str else os.path.join(OUTPUT_DIR, "*.csv")
         csv_files = glob.glob(pattern)
         if not csv_files:
             return 0
-            
-        current_sheet_df = load_airregi_data()
-        new_records = []
+
+        # ファイルを年ごとにグループ分け
+        files_by_year = {}
         for f in csv_files:
-            base = os.path.basename(f)
-            m = re.search(r"(\d{4}-\d{2}-\d{2})", base)
-            if not m:
-                continue
-            f_date = m.group(1)
-            try:
-                raw = pd.read_csv(f, header=None)
-                if raw.empty:
+            m = re.search(r"(\d{4})-(\d{2}-\d{2})", os.path.basename(f))
+            if m:
+                year_str = m.group(1)
+                date_str = f"{year_str}-{m.group(2)}"
+                files_by_year.setdefault(year_str, []).append((date_str, f))
+
+        total_synced_dates = 0
+        for y_str, f_list in files_by_year.items():
+            new_records = []
+            for date_str, f_path in f_list:
+                try:
+                    raw = pd.read_csv(f_path, header=None)
+                    if raw.empty: continue
+                    raw.insert(0, "date", date_str)
+                    raw.columns = ["date"] + [f"c{i}" for i in range(raw.shape[1] - 1)]
+                    new_records.append(raw)
+                except Exception:
                     continue
-                raw.insert(0, "date", f_date)
-                cols = ["date"] + [f"c{i}" for i in range(raw.shape[1] - 1)]
-                raw.columns = cols
-                new_records.append(raw)
-            except Exception:
+
+            if not new_records:
                 continue
 
-        if not new_records:
-            return 0
+            year_new_df = pd.concat(new_records, ignore_index=True)
+            current_sheet_df = get_airregi_sheet_for_year(y_str)
 
-        all_new_df = pd.concat(new_records, ignore_index=True)
-        
-        if not current_sheet_df.empty and "date" in current_sheet_df.columns:
-            dates_to_replace = all_new_df["date"].unique()
-            kept_df = current_sheet_df[~current_sheet_df["date"].isin(dates_to_replace)]
-            final_df = pd.concat([kept_df, all_new_df], ignore_index=True)
-        else:
-            final_df = all_new_df
+            if not current_sheet_df.empty and "date" in current_sheet_df.columns:
+                dates_to_replace = year_new_df["date"].unique()
+                kept_df = current_sheet_df[~current_sheet_df["date"].isin(dates_to_replace)]
+                final_df = pd.concat([kept_df, year_new_df], ignore_index=True)
+            else:
+                final_df = year_new_df
 
-        conn.update(worksheet="airregi_sales", data=final_df)
-        return len(all_new_df["date"].unique())
+            conn.update(spreadsheet=AIRREGI_SPREADSHEET_URL, worksheet=str(y_str), data=final_df)
+            total_synced_dates += len(year_new_df["date"].unique())
+
+        return total_synced_dates
     except Exception as e:
         st.error(f"スプレッドシートへの保存中にエラーが発生しました: {e}")
         return 0
 
 def find_and_read_airregi(date_str):
-    """まずスプレッドシートから読み込み、無ければローカルCSVを探す"""
-    # 1. スプレッドシートから探索
-    air_df = load_airregi_data()
-    if not air_df.empty and "date" in air_df.columns:
-        sub = air_df[air_df["date"].astype(str).str.strip() == date_str.strip()]
+    """まず指定年のスプレッドシートタブを探索し、無ければローカルCSVを探す"""
+    year_str = date_str.split("-")[0]
+    
+    # 1. スプレッドシート探索
+    df_year = get_airregi_sheet_for_year(year_str)
+    if not df_year.empty and "date" in df_year.columns:
+        sub = df_year[df_year["date"].astype(str).str.strip() == date_str.strip()]
         if not sub.empty:
             sub_data = sub.drop(columns=["date"]).reset_index(drop=True)
             sub_data.columns = range(sub_data.shape[1])
-            return sub_data, f"Googleスプレッドシート ({date_str})"
+            return sub_data, f"Googleスプレッドシート (Airレジ売上 {year_str}年)"
 
-    # 2. ローカルCSVから探索（フォールバック）
+    # 2. ローカルCSV探索
     d_dash = date_str
     d_nodash = date_str.replace("-", "")
     d_under = date_str.replace("-", "_")
@@ -174,28 +196,26 @@ def find_and_read_airregi(date_str):
 
 def get_available_months():
     months = set()
-    # スプレッドシートから日付を取得
-    try:
-        air_df = load_airregi_data()
-        if not air_df.empty and "date" in air_df.columns:
-            for d in air_df["date"].dropna().astype(str):
-                m = re.search(r"(\d{4})-(\d{2})", d)
-                if m: months.add(f"{m.group(1)}-{m.group(2)}")
-    except Exception:
-        pass
+    # 表示年のスプレッドシートタブから月を収集
+    display_year = st.session_state.get("display_year", str(datetime.now().year))
+    df_cur_year = get_airregi_sheet_for_year(display_year)
+    if not df_cur_year.empty and "date" in df_cur_year.columns:
+        for d in df_cur_year["date"].dropna().astype(str):
+            m = re.search(r"(\d{4})-(\d{2})", d)
+            if m: months.add(f"{m.group(1)}-{m.group(2)}")
 
-    # ローカルCSVからも取得
+    # ローカルCSVからも収集
     all_files = glob.glob(os.path.join(OUTPUT_DIR, "*.csv"))
     for f in all_files:
         base = os.path.basename(f)
-        match = re.search(r"(\d{4})-(\d{2})-\d{2}", base)
-        if match: months.add(f"{match.group(1)}-{match.group(2)}")
-            
+        m = re.search(r"(\d{4})-(\d{2})-\d{2}", base)
+        if m: months.add(f"{m.group(1)}-{m.group(2)}")
+
     if not months:
-        return [datetime.now().strftime("%Y-%m")]
+        return [f"{display_year}-10", f"{display_year}-01"]
     return sorted(list(months), reverse=True)
 
-# --- スプレッドシートへの保存関数群 ---
+# --- 予約・デリバリー更新関数 ---
 def save_delivery_data(date_str, store, time_slot, uber, rocket_now, demaekan, other):
     df = load_delivery_data()
     df = df[~((df["date"] == date_str) & (df["store"] == store) & (df["time_slot"] == time_slot))]
@@ -456,11 +476,12 @@ def create_multi_sheet_excel(selected_store, year, month, bp_df, deliv_df, res_d
         if "Sheet" in workbook.sheetnames: workbook.remove(workbook["Sheet"])
     return output.getvalue()
 
-available_months = get_available_months()
-available_years = sorted(list(set([m.split("-")[0] for m in available_months])), reverse=True)
+# 利用可能な年一覧
+current_year_num = datetime.now().year
+available_years = [str(y) for y in range(current_year_num, current_year_num - 11, -1)]
 
 if "selected_store" not in st.session_state: st.session_state["selected_store"] = STORES[0]
-if "display_year" not in st.session_state: st.session_state["display_year"] = available_years[0] if available_years else str(datetime.now().year)
+if "display_year" not in st.session_state: st.session_state["display_year"] = str(current_year_num)
 if "target_date_state" not in st.session_state: st.session_state["target_date_state"] = datetime.now().date()
 
 if "form_d_key" not in st.session_state: st.session_state["form_d_key"] = 0
@@ -471,14 +492,14 @@ def prev_year_action():
     idx = available_years.index(st.session_state["display_year"]) if st.session_state["display_year"] in available_years else 0
     if idx < len(available_years) - 1:
         st.session_state["display_year"] = available_years[idx + 1]
-        m = [m for m in available_months if m.startswith(available_years[idx + 1])]
+        m = get_available_months()
         if m: st.session_state["selected_year_month"] = m[0]
 
 def next_year_action():
     idx = available_years.index(st.session_state["display_year"]) if st.session_state["display_year"] in available_years else 0
     if idx > 0:
         st.session_state["display_year"] = available_years[idx - 1]
-        m = [m for m in available_months if m.startswith(available_years[idx - 1])]
+        m = get_available_months()
         if m: st.session_state["selected_year_month"] = m[0]
 
 st.sidebar.title("メニュー")
@@ -493,7 +514,8 @@ with col_year: st.markdown(f"<div style='text-align: center; padding-top: 5px; f
 with col_next: st.button("▶", key="next_year", on_click=next_year_action)
 
 display_year = st.session_state["display_year"]
-months_in_year = [m for m in available_months if m.startswith(display_year)] or [f"{display_year}-01"]
+available_months = get_available_months()
+months_in_year = [m for m in available_months if m.startswith(display_year)] or [f"{display_year}-10", f"{display_year}-01"]
 st.sidebar.selectbox("対象月", months_in_year, key="selected_year_month")
 
 # --- 売上データ取得ブロック ---
@@ -520,15 +542,11 @@ with st.sidebar.expander("📥 売上データを取得する"):
 
                 if not air_id and "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
                     gsheets_sec = st.secrets["connections"]["gsheets"]
-                    if "AIRREGI_ID" in gsheets_sec:
-                        air_id = gsheets_sec["AIRREGI_ID"]
-                    if "AIRREGI_PASS" in gsheets_sec:
-                        air_pass = gsheets_sec["AIRREGI_PASS"]
+                    if "AIRREGI_ID" in gsheets_sec: air_id = gsheets_sec["AIRREGI_ID"]
+                    if "AIRREGI_PASS" in gsheets_sec: air_pass = gsheets_sec["AIRREGI_PASS"]
 
-                if air_id:
-                    custom_env["AIRREGI_ID"] = str(air_id)
-                if air_pass:
-                    custom_env["AIRREGI_PASS"] = str(air_pass)
+                if air_id: custom_env["AIRREGI_ID"] = str(air_id)
+                if air_pass: custom_env["AIRREGI_PASS"] = str(air_pass)
 
                 res = subprocess.run(
                     [sys.executable, "get_monthly_data.py", target_str, target_str],
@@ -540,34 +558,22 @@ with st.sidebar.expander("📥 売上データを取得する"):
                     check=True
                 )
                 
-                # 取得完了後、スプレッドシートの airregi_sales へ自動同期
-                synced_count = save_airregi_csv_to_sheets(target_str)
-                st.success(f"🎉 取得＆スプレッドシートへの保存が完了しました！（{target_str}）")
-                
-                with st.expander("📄 実行ログ（標準出力 / エラー）", expanded=False):
-                    if res.stdout:
-                        st.markdown("**【標準出力】**")
-                        st.code(res.stdout, language="text")
-                    if res.stderr:
-                        st.markdown("**【標準エラー】**")
-                        st.code(res.stderr, language="text")
-                
+                # スプレッドシートの年別タブへ自動保存
+                n = save_airregi_csv_to_sheets(target_str)
+                st.success(f"🎉 取得＆スプレッドシートへ保存完了！（{target_str}）")
                 st.rerun()
 
             except subprocess.CalledProcessError as e:
                 st.error("⚠️ データ取得処理でエラーが発生しました。")
                 err_detail = ""
-                if e.stderr:
-                    err_detail += f"【標準エラー】:\n{e.stderr}\n\n"
-                if e.stdout:
-                    err_detail += f"【標準出力】:\n{e.stdout}"
+                if e.stderr: err_detail += f"【標準エラー】:\n{e.stderr}\n\n"
+                if e.stdout: err_detail += f"【標準出力】:\n{e.stdout}"
                 st.code(err_detail if err_detail else "エラーメッセージはありませんでした。", language="text")
-                
                 if os.path.exists("error_screenshot.png"):
                     st.image("error_screenshot.png", caption="エラー発生時のブラウザ画面")
 
-    # サーバー上の全CSVを一括でスプレッドシートへ退避・同期するボタン
-    if st.button("☁️ 取得済みCSVを全てスプレッドシートに同期", help="サーバー上にある過去のCSVファイルをすべてスプレッドシートに保存します"):
+    # 過去CSV一括同期ボタン
+    if st.button("☁️ 取得済みCSVを年別シートに全同期", help="サーバー上にある全CSVを年ごとのシートに自動で振り分けて保存します"):
         with st.spinner("スプレッドシートへ同期中..."):
             n = save_airregi_csv_to_sheets()
             if n > 0:
@@ -1105,4 +1111,55 @@ else:
 
     def render_styled_html_table(df, is_summary=False):
         header_bg, header_color = ("#f39c12", "#ffffff")
-        wrap_style = "overflow-x: auto; margin-bottom: 20px;" if is_summary else "max-height: 60vh; overflow-y: auto
+        wrap_style = "overflow-x: auto; margin-bottom: 20px;" if is_summary else "max-height: 60vh; overflow-y: auto; overflow-x: auto; margin-bottom: 20px;"
+        
+        html = f'<div style="{wrap_style}"><table style="width: 100%; border-collapse: collapse; font-family: sans-serif; font-size: 14px; white-space: nowrap;"><thead><tr style="text-align: center;">'
+        for col in df.columns: 
+            html += f'<th style="position: sticky; top: 0; background-color: {header_bg}; color: {header_color}; border: 1px solid #e0e0e0; padding: 8px; font-weight: bold; z-index: 1;">{col}</th>'
+        html += "</tr></thead><tbody>"
+        
+        for idx, row in df.iterrows():
+            bg_color = "#fffbf0" if idx % 2 == 0 else "#ffffff"
+            html += f'<tr style="background-color: {bg_color}; text-align: center;">'
+            for col in df.columns:
+                val = str(row[col])
+                style = "border: 1px solid #e0e0e0; padding: 8px; white-space: nowrap;"
+                if col in ["前年比", "予算比", "客数前年比", "単価前年比"] or "%" in val:
+                    if "%" in val:
+                        try:
+                            num = float(val.replace("%", "").strip())
+                            style += " color: #27ae60; font-weight: bold;" if num >= 100.0 else " color: #c0392b; font-weight: bold;"
+                        except: style += " font-weight: bold;"
+                    else: style += " font-weight: bold;"
+                elif "-" in val and any(char.isdigit() for char in val): style += " color: #c0392b; font-weight: bold;"
+                elif col in ["前年売上", "予算売上", "実績売上", "店頭売上", "デリバリー売上", "その他売上", "予約金", "売上計上", "前年単価", "実績単価"] or is_summary: style += " font-weight: bold;"
+                html += f'<td style="{style}">{val}</td>'
+            html += "</tr>"
+        return html + "</tbody></table></div>"
+
+    st.markdown(f"### 【{max_day}日時点 累計サマリー】")
+    st.markdown(render_styled_html_table(pd.DataFrame(summary_data), is_summary=True), unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("### 🔍 表示する時間帯を選択してください")
+    
+    if "active_slot_tab" not in st.session_state: st.session_state["active_slot_tab"] = "合計"
+    selected_tab = st.radio("時間帯タブ", ["合計", "早番", "中番", "遅番"], horizontal=True, label_visibility="collapsed")
+    st.session_state["active_slot_tab"] = selected_tab
+    current_kw = {"合計": None, "早番": "早番", "中番": "中番", "遅番": "遅番"}[selected_tab]
+    
+    df_current_slot = generate_month_df(selected_store, year, month, current_kw, bp_df, deliv_df, res_df, res_sales_df)
+    df_current_slot_formatted = df_current_slot.copy()
+    for col in ["前年売上", "予算売上", "実績売上", "店頭売上", "デリバリー売上", "その他売上", "予約金", "売上計上", "前年単価", "実績単価"]:
+        df_current_slot_formatted[col] = df_current_slot_formatted[col].apply(format_currency)
+
+    st.markdown("---")
+    col_title, col_btn = st.columns([8, 2])
+    with col_title:
+        st.markdown("### 📅 日別実績一覧")
+    with col_btn:
+        excel_data = create_multi_sheet_excel(selected_store, year, month, bp_df, deliv_df, res_df, res_sales_df)
+        st.markdown("<div style='padding-top: 10px;'></div>", unsafe_allow_html=True)
+        st.download_button(label="📥 Excelダウンロード", data=excel_data, file_name=f"{selected_store}_{year}年{month}月度_売上月報.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
+
+    st.markdown(render_styled_html_table(df_current_slot_formatted), unsafe_allow_html=True)
