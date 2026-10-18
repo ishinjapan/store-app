@@ -96,17 +96,32 @@ def match_slot_row(store_df, slot_name):
 
 
 # --- キャッシュ付きデータロード関数群 ---
-@st.cache_data(ttl=600)
+# ★修正: ttl=0 にして常に最新データを取得（修正確認後は ttl=600 に戻してOK）
+@st.cache_data(ttl=0)
 def load_budget_prev_data():
   try:
     df = conn.read(worksheet="budget_prev", ttl=0).dropna(how="all")
     if not df.empty:
-      df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
-      # ★ここを追加：日付・店舗・シフトの重複行を自動で1つにまとめる
-      if {"date", "store", "time_slot"}.issubset(df.columns):
-        df = df.drop_duplicates(
-            subset=["date", "store", "time_slot"], keep="first"
-        )
+      # 1. 列名の前後の空白文字をすべて完全に除去
+      df.columns = [str(c).strip() for c in df.columns]
+
+      # 2. シフト名の正規化
+      if "time_slot" in df.columns:
+        df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
+
+      # 3. 日付と店舗名の空白も除去して型を揃える
+      if "date" in df.columns:
+        df["date"] = df["date"].astype(str).str.strip()
+      if "store" in df.columns:
+        df["store"] = df["store"].astype(str).str.strip()
+
+      # 4. 【確実に重複排除】日付・店舗・シフトが同じ行を1件だけに絞り込む
+      target_sub = [
+          c for c in ["date", "store", "time_slot"] if c in df.columns
+      ]
+      if target_sub:
+        df = df.drop_duplicates(subset=target_sub, keep="first")
+
     return df
   except Exception:
     return pd.DataFrame(
