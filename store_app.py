@@ -68,7 +68,8 @@ def match_slot_row(store_df, slot_name):
     return store_df[store_df[1].astype(str).str.contains(short_slot, na=False)]
 
 # --- キャッシュ付きデータロード関数群 ---
-@st.cache_data(ttl=600)
+# ★確実に即時反映させるため ttl=0 に設定（修正確認後は 600 に戻してOK）
+@st.cache_data(ttl=0)
 def load_budget_prev_data():
     try:
         df = conn.read(worksheet="budget_prev", ttl=0).dropna(how="all")
@@ -80,14 +81,20 @@ def load_budget_prev_data():
             if "time_slot" in df.columns:
                 df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
 
-            # 3. ★ここが最重要：スプレッドシートの「2026/10/1」などを「2026-10-01」に強制変換して統一
+            # 3. 日付の表記揺れ（2026/10/1 -> 2026-10-01）を強制統一
             if "date" in df.columns:
                 df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.strftime("%Y-%m-%d")
 
             if "store" in df.columns:
                 df["store"] = df["store"].astype(str).str.strip()
 
-            # 4. 日付・店舗・シフトが同じ行を1件だけに絞り込む
+            # 4. ★最重要★ 売上や客数を確実に「数値」に変換（776450のような文字結合の暴走を防ぐ）
+            num_cols = ["budget_sales", "prev_sales", "prev_cust", "budget_cust", "store_sales", "delivery_sales"]
+            for c in num_cols:
+                if c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+            # 5. 日付・店舗・シフトが同じ行を1件だけに絞り込む（スプレッドシート上に何十個重複があっても1つにカット）
             target_sub = [
                 c for c in ["date", "store", "time_slot"] if c in df.columns
             ]
@@ -96,7 +103,6 @@ def load_budget_prev_data():
 
         return df
     except Exception as e:
-        # 万が一エラーが起きた場合は画面に赤文字でエラー理由を表示する
         st.error(f"スプレッドシートの読み込みエラー: {e}")
         return pd.DataFrame(
             columns=[
