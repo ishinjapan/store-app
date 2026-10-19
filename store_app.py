@@ -254,10 +254,12 @@ def get_airregi_sheet_for_year(year_str):
     return pd.DataFrame()
 
 
-def save_airregi_csv_to_sheets(target_date_str=None):
+def save_airregi_csv_to_sheets(
+    target_date_str=None, start_date_str=None, end_date_str=None
+):
   if not AIRREGI_SPREADSHEET_URL:
-    st.warning(
-        "⚠️ AIRREGI_SPREADSHEET の設定が見つかりません。Secretsを確認してください。"
+    raise RuntimeError(
+        "AIRREGI_SPREADSHEET の設定が見つかりません。Secretsを確認してください。"
     )
     return 0
 
@@ -277,6 +279,10 @@ def save_airregi_csv_to_sheets(target_date_str=None):
       if m:
         year_str = m.group(1)
         date_str = f"{year_str}-{m.group(2)}"
+        if start_date_str and date_str < start_date_str:
+          continue
+        if end_date_str and date_str > end_date_str:
+          continue
         files_by_year.setdefault(year_str, []).append((date_str, f))
 
     total_synced_dates = 0
@@ -307,8 +313,11 @@ def save_airregi_csv_to_sheets(target_date_str=None):
         current_sheet_df = conn.read(
             spreadsheet=AIRREGI_SPREADSHEET_URL, worksheet=str(y_str), ttl=0
         ).dropna(how="all")
-      except Exception:
-        current_sheet_df = pd.DataFrame()
+      except Exception as e:
+        raise RuntimeError(
+            f"{y_str}年シートの既存データを読み込めないため、"
+            "既存データ保護のため同期を中止しました。"
+        ) from e
 
       if not current_sheet_df.empty and "date" in current_sheet_df.columns:
         if "c1" in current_sheet_df.columns:
@@ -342,8 +351,9 @@ def save_airregi_csv_to_sheets(target_date_str=None):
     st.cache_data.clear()
     return total_synced_dates
   except Exception as e:
-    st.error(f"スプレッドシートへの保存中にエラーが発生しました: {e}")
-    return 0
+    raise RuntimeError(
+        f"スプレッドシートへの保存中にエラーが発生しました: {e}"
+    ) from e
 
 
 def find_airregi_data_in_memory(date_str, df_year):
@@ -1248,6 +1258,96 @@ def next_year_action():
       st.session_state["selected_year_month"] = m[0]
 
 
+def run_airregi_extraction(start_date_str, end_date_str):
+  subprocess.run(
+      [sys.executable, "-m", "playwright", "install", "chromium"],
+      capture_output=True,
+      check=True,
+  )
+
+  custom_env = os.environ.copy()
+  air_id = st.secrets.get("AIRREGI_ID")
+  air_pass = st.secrets.get("AIRREGI_PASS")
+
+  if (
+      not air_id
+      and "connections" in st.secrets
+      and "gsheets" in st.secrets["connections"]
+  ):
+    gsheets_sec = st.secrets["connections"]["gsheets"]
+    air_id = gsheets_sec.get("AIRREGI_ID")
+    air_pass = gsheets_sec.get("AIRREGI_PASS")
+
+  if air_id:
+    custom_env["AIRREGI_ID"] = str(air_id)
+  if air_pass:
+    custom_env["AIRREGI_PASS"] = str(air_pass)
+
+  command = [
+      sys.executable,
+      "-u",
+      "get_monthly_data.py",
+      start_date_str,
+      end_date_str,
+  ]
+  start_dt = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+  end_dt = datetime.strptime(end_date_str, "%Y-%m-%d").date()
+  total_days = (end_dt - start_dt).days + 1
+  completed_days = 0
+  output_lines = []
+  progress = st.progress(0, text=f"取得準備中（0/{total_days}日）")
+
+  with subprocess.Popen(
+      command,
+      stdout=subprocess.PIPE,
+      stderr=subprocess.STDOUT,
+      text=True,
+      encoding="utf-8",
+      errors="replace",
+      bufsize=1,
+      env=custom_env,
+  ) as process:
+    if process.stdout is None:
+      raise RuntimeError("データ取得プロセスの出力を読み取れません。")
+    for line in process.stdout:
+      output_lines.append(line)
+      match = re.search(r"処理日】\s*(\d{4}-\d{2}-\d{2})", line)
+      if match:
+        completed_days += 1
+        progress.progress(
+            min(completed_days / total_days, 1.0),
+            text=f"取得中: {match.group(1)}（{completed_days}/{total_days}日）",
+        )
+    return_code = process.wait()
+
+  output = "".join(output_lines)
+  if return_code:
+    progress.empty()
+    raise subprocess.CalledProcessError(
+        return_code,
+        command,
+        output=output,
+    )
+
+  progress.progress(1.0, text=f"取得完了（{total_days}/{total_days}日）")
+  return subprocess.CompletedProcess(command, return_code, stdout=output)
+
+
+def show_airregi_extraction_error(error):
+  st.error("⚠️ データ取得処理でエラーが発生しました。")
+  err_detail = ""
+  if error.stderr:
+    err_detail += f"【標準エラー】:\n{error.stderr}\n\n"
+  if error.stdout:
+    err_detail += f"【標準出力】:\n{error.stdout}"
+  st.code(
+      err_detail if err_detail else "エラーメッセージはありませんでした。",
+      language="text",
+  )
+  if os.path.exists("error_screenshot.png"):
+    st.image("error_screenshot.png", caption="エラー発生時のブラウザ画面")
+
+
 st.sidebar.title("メニュー")
 st.sidebar.markdown("---")
 st.sidebar.subheader("店舗・期間設定")
@@ -1282,69 +1382,74 @@ with st.sidebar.expander("📥 売上データを取得する"):
     target_str = target_date.strftime("%Y-%m-%d")
     with st.spinner(f"{target_str} 取得中... (完了までお待ちください)"):
       try:
-        subprocess.run(
-            [sys.executable, "-m", "playwright", "install", "chromium"],
-            capture_output=True,
-            check=True,
-        )
-
-        custom_env = os.environ.copy()
-        air_id = None
-        air_pass = None
-
-        if "AIRREGI_ID" in st.secrets:
-          air_id = st.secrets["AIRREGI_ID"]
-        if "AIRREGI_PASS" in st.secrets:
-          air_pass = st.secrets["AIRREGI_PASS"]
-
-        if (
-            not air_id
-            and "connections" in st.secrets
-            and "gsheets" in st.secrets["connections"]
-        ):
-          gsheets_sec = st.secrets["connections"]["gsheets"]
-          if "AIRREGI_ID" in gsheets_sec:
-            air_id = gsheets_sec["AIRREGI_ID"]
-          if "AIRREGI_PASS" in gsheets_sec:
-            air_pass = gsheets_sec["AIRREGI_PASS"]
-
-        if air_id:
-          custom_env["AIRREGI_ID"] = str(air_id)
-        if air_pass:
-          custom_env["AIRREGI_PASS"] = str(air_pass)
-
-        res = subprocess.run(
-            [
-                sys.executable,
-                "get_monthly_data.py",
-                target_str,
-                target_str,
-            ],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            env=custom_env,
-            check=True,
-        )
-
+        run_airregi_extraction(target_str, target_str)
         n = save_airregi_csv_to_sheets(target_str)
-        st.success(f"🎉 取得＆スプレッドシートへ保存完了！（{target_str}）")
-        st.rerun()
-
-      except subprocess.CalledProcessError as e:
-        st.error("⚠️ データ取得処理でエラーが発生しました。")
-        err_detail = ""
-        if e.stderr:
-          err_detail += f"【標準エラー】:\n{e.stderr}\n\n"
-        if e.stdout:
-          err_detail += f"【標準出力】:\n{e.stdout}"
-        st.code(
-            err_detail if err_detail else "エラーメッセージはありませんでした。",
-            language="text",
+        st.success(
+            f"🎉 {target_str} のデータを取得し、"
+            f"スプレッドシートへ {n} 日分を保存しました！"
         )
-        if os.path.exists("error_screenshot.png"):
-          st.image("error_screenshot.png", caption="エラー発生時のブラウザ画面")
+        st.rerun()
+      except subprocess.CalledProcessError as e:
+        show_airregi_extraction_error(e)
+      except Exception as e:
+        st.error(f"データの取得またはスプレッドシートへの保存に失敗しました: {e}")
+
+  st.markdown("#### 期間を指定して取得")
+  date_col_start, date_col_end = st.columns(2)
+  with date_col_start:
+    start_date = st.date_input(
+        "開始日",
+        value=datetime(2025, 10, 1).date(),
+        key="fetch_start_date_sidebar",
+    )
+  with date_col_end:
+    end_date = st.date_input(
+        "終了日",
+        value=datetime(2026, 9, 30).date(),
+        key="fetch_end_date_sidebar",
+    )
+  st.caption("期間取得は時間がかかります。処理中は画面を閉じずにお待ちください。")
+  if st.button("📅 期間取得を実行", key="fetch_date_range_button"):
+    if start_date > end_date:
+      st.error("開始日は終了日以前の日付を指定してください。")
+    else:
+      start_str = start_date.strftime("%Y-%m-%d")
+      end_str = end_date.strftime("%Y-%m-%d")
+      date_count = (end_date - start_date).days + 1
+      with st.spinner(
+          f"{start_str} 〜 {end_str} の {date_count} 日分を取得中です。"
+          "完了まで画面を閉じずにお待ちください..."
+      ):
+        try:
+          run_airregi_extraction(start_str, end_str)
+          n = save_airregi_csv_to_sheets(
+              start_date_str=start_str,
+              end_date_str=end_str,
+          )
+          st.success(
+              f"🎉 期間取得とスプレッドシートへの保存が完了しました。"
+              f"（対象 {date_count} 日、保存 {n} 日）"
+          )
+          st.rerun()
+        except subprocess.CalledProcessError as e:
+          st.error(
+              f"⚠️ 期間取得に失敗しました。"
+              f"取得済みCSVは {start_str} 〜 {end_str} で同期します。"
+          )
+          try:
+            n = save_airregi_csv_to_sheets(
+                start_date_str=start_str,
+                end_date_str=end_str,
+            )
+            st.info(f"失敗前に取得できた {n} 日分を同期しました。")
+          except Exception as sync_error:
+            st.error(f"取得済みCSVの同期にも失敗しました: {sync_error}")
+          show_airregi_extraction_error(e)
+        except Exception as e:
+          st.error(
+              f"期間データのスプレッドシートへの保存に失敗しました。"
+              f"取得済みCSVはローカルに残っています: {e}"
+          )
 
   if st.button(
       "☁️ 取得済みCSVを年別シートに全同期",
@@ -1353,14 +1458,17 @@ with st.sidebar.expander("📥 売上データを取得する"):
       ),
   ):
     with st.spinner("スプレッドシートへ同期中..."):
-      n = save_airregi_csv_to_sheets()
-      if n > 0:
-        st.success(
-            f"🎉 サーバー上の {n} 日分の売上データをスプレッドシートに同期しました！"
-        )
-        st.rerun()
-      else:
-        st.info("同期対象のCSVファイルがありませんでした。")
+      try:
+        n = save_airregi_csv_to_sheets()
+        if n > 0:
+          st.success(
+              f"🎉 サーバー上の {n} 日分の売上データをスプレッドシートに同期しました！"
+          )
+          st.rerun()
+        else:
+          st.info("同期対象のCSVファイルがありませんでした。")
+      except Exception as e:
+        st.error(f"スプレッドシートへの同期に失敗しました: {e}")
 
 st.sidebar.markdown("---")
 app_mode = st.sidebar.radio(
