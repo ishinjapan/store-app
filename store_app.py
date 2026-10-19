@@ -76,10 +76,10 @@ def normalize_time_slot(val):
 def parse_int(val):
   if pd.isna(val):
     return 0
-  clean_str = re.sub(r"[^\d-]", "", str(val))
+  clean_str = re.sub(r"[^\d.-]", "", str(val))
   try:
-    return int(clean_str)
-  except ValueError:
+    return int(float(clean_str))
+  except (ValueError, OverflowError):
     return 0
 
 
@@ -96,7 +96,7 @@ def match_slot_row(store_df, slot_name):
 
 
 # --- キャッシュ付きデータロード関数群 ---
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=60)
 def load_budget_prev_data():
   try:
     df = conn.read(worksheet="budget_prev", ttl=0).dropna(how="all")
