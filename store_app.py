@@ -204,25 +204,60 @@ def update_actual_customer_column(uploaded_file):
   csv_index = pd.MultiIndex.from_frame(sheet_keys[key_columns])
   actual_counts = counts_by_key.reindex(csv_index)
   sheet_df = sheet_df.drop(columns=sheet_key_columns)
-  if "actual_cust" in sheet_df.columns:
-    customer_column = sheet_df.columns.get_loc("actual_cust") + 1
-  else:
-    customer_column = len(sheet_df.columns) + 1
-  column_letter = get_column_letter(customer_column)
-  last_row = len(sheet_df) + 1
-  values = [["actual_cust"]] + [
-      ["" if pd.isna(value) else int(value)] for value in actual_counts
-  ]
+  delivery_sales = (
+      pd.to_numeric(sheet_df["delivery_sales"], errors="coerce").fillna(0)
+      if "delivery_sales" in sheet_df.columns
+      else pd.Series(0, index=sheet_df.index)
+  )
+  estimated_delivery_counts = delivery_sales.apply(estimate_delivery_count)
+  delivery_counts = (
+      pd.to_numeric(sheet_df["delivery_count"], errors="coerce")
+      if "delivery_count" in sheet_df.columns
+      else pd.Series(pd.NA, index=sheet_df.index, dtype="Float64")
+  ).fillna(estimated_delivery_counts).astype("Int64")
+  delivery_unit_prices = (
+      pd.to_numeric(sheet_df["delivery_unit_price"], errors="coerce")
+      if "delivery_unit_price" in sheet_df.columns
+      else pd.Series(pd.NA, index=sheet_df.index, dtype="Float64")
+  ).fillna(DELIVERY_UNIT_PRICE).astype("Int64")
 
-  # conn.updateはシート全体を書き換えるため、客数列だけを範囲更新する。
+  column_numbers = {}
+  next_column = len(sheet_df.columns) + 1
+  for column in ["actual_cust", "delivery_count", "delivery_unit_price"]:
+    if column in sheet_df.columns:
+      column_numbers[column] = sheet_df.columns.get_loc(column) + 1
+    else:
+      column_numbers[column] = next_column
+      next_column += 1
+  last_row = len(sheet_df) + 1
   worksheet = conn.client._select_worksheet(worksheet="budget_prev")
-  worksheet.update(
-      f"{column_letter}1:{column_letter}{last_row}",
-      values,
+  worksheet.batch_update(
+      [
+          {
+              "range": (
+                  f"{get_column_letter(column_numbers[column])}1:"
+                  f"{get_column_letter(column_numbers[column])}{last_row}"
+              ),
+              "values": [[column]]
+              + [
+                  ["" if pd.isna(value) else int(value)]
+                  for value in column_values
+              ],
+          }
+          for column, column_values in [
+              ("actual_cust", actual_counts),
+              ("delivery_count", delivery_counts),
+              ("delivery_unit_price", delivery_unit_prices),
+          ]
+      ],
       value_input_option="USER_ENTERED",
   )
   load_budget_prev_data.clear()
-  return len(csv_df), int(csv_df["actual_cust"].isna().sum())
+  return (
+      len(csv_df),
+      int(csv_df["actual_cust"].isna().sum()),
+      int(delivery_counts.sum()),
+  )
 
 
 @st.cache_data(ttl=60)
@@ -242,6 +277,9 @@ def load_budget_prev_data():
             "budget_cust",
             "store_sales",
             "delivery_sales",
+            "actual_cust",
+            "delivery_count",
+            "delivery_unit_price",
         ]
     )
 
@@ -264,6 +302,8 @@ def load_delivery_data():
             "rocket_now",
             "demaekan",
             "other",
+            "delivery_count",
+            "delivery_unit_price",
         ]
     )
   except Exception:
@@ -276,6 +316,8 @@ def load_delivery_data():
             "rocket_now",
             "demaekan",
             "other",
+            "delivery_count",
+            "delivery_unit_price",
         ]
     )
 
@@ -520,6 +562,24 @@ def save_delivery_data(
     date_str, store, time_slot, uber, rocket_now, demaekan, other
 ):
   df = load_delivery_data()
+  existing = df[
+      (df["date"] == date_str)
+      & (df["store"] == store)
+      & (df["time_slot"] == time_slot)
+  ]
+  delivery_count = estimate_delivery_count(uber + rocket_now + demaekan)
+  delivery_unit_price = DELIVERY_UNIT_PRICE
+  if not existing.empty:
+    if "delivery_count" in existing.columns and pd.notna(
+        existing["delivery_count"].iloc[0]
+    ):
+      delivery_count = parse_int(existing["delivery_count"].iloc[0])
+    if "delivery_unit_price" in existing.columns and pd.notna(
+        existing["delivery_unit_price"].iloc[0]
+    ):
+      delivery_unit_price = parse_int(
+          existing["delivery_unit_price"].iloc[0]
+      )
   df = df[
       ~(
           (df["date"] == date_str)
@@ -535,6 +595,8 @@ def save_delivery_data(
       "rocket_now": rocket_now,
       "demaekan": demaekan,
       "other": other,
+      "delivery_count": delivery_count,
+      "delivery_unit_price": delivery_unit_price,
   }])
   df = pd.concat([df, new_row], ignore_index=True)
   conn.update(worksheet="delivery_sales", data=df)
@@ -658,6 +720,14 @@ def generate_month_df(
           break
 
       actual_cust_col = "actual_cust" if "actual_cust" in bp_sub.columns else None
+      delivery_count_col = (
+          "delivery_count" if "delivery_count" in bp_sub.columns else None
+      )
+      delivery_unit_price_col = (
+          "delivery_unit_price"
+          if "delivery_unit_price" in bp_sub.columns
+          else None
+      )
 
       s_sales_col = None
       for c in [
@@ -672,7 +742,13 @@ def generate_month_df(
           break
 
       d_sales_col = None
-      for c in ["delivery_sales", "デリバリー売上", "uber_sales", "uber"]:
+      for c in [
+          "delivery_sales",
+          "D売上",
+          "デリバリー売上",
+          "uber_sales",
+          "uber",
+      ]:
         if c in bp_sub.columns:
           d_sales_col = c
           break
@@ -691,12 +767,35 @@ def generate_month_df(
             if actual_cust_col and len(actual_cust_values) == len(grp)
             else None
         )
+        delivery_count_values = (
+            pd.to_numeric(grp[delivery_count_col], errors="coerce").dropna()
+            if delivery_count_col
+            else pd.Series(dtype="float64")
+        )
+        delivery_count_val = (
+            int(delivery_count_values.sum())
+            if delivery_count_col and len(delivery_count_values) == len(grp)
+            else None
+        )
+        delivery_unit_price_values = (
+            pd.to_numeric(grp[delivery_unit_price_col], errors="coerce").dropna()
+            if delivery_unit_price_col
+            else pd.Series(dtype="float64")
+        )
+        delivery_unit_price_val = (
+            int(delivery_unit_price_values.iloc[0])
+            if delivery_unit_price_col
+            and len(delivery_unit_price_values) == len(grp)
+            else None
+        )
         bp_dict[d] = {
             "prev_sales": parse_int(grp["prev_sales"].sum()),
             "budget_sales": parse_int(grp["budget_sales"].sum()),
             "prev_cust": parse_int(grp["prev_cust"].sum()),
             "budget_cust": b_cust_val,
             "actual_cust": actual_cust_val,
+            "delivery_count": delivery_count_val,
+            "delivery_unit_price": delivery_unit_price_val,
             "store_sales": s_sales_val,
             "delivery_sales": d_sales_val,
         }
@@ -719,13 +818,37 @@ def generate_month_df(
       d_sub["other_n"] = pd.to_numeric(d_sub["other"], errors="coerce").fillna(
           0
       )
+      if "delivery_count" in d_sub.columns:
+        d_sub["delivery_count_n"] = pd.to_numeric(
+            d_sub["delivery_count"], errors="coerce"
+        )
+      else:
+        d_sub["delivery_count_n"] = pd.NA
+      if "delivery_unit_price" in d_sub.columns:
+        d_sub["delivery_unit_price_n"] = pd.to_numeric(
+            d_sub["delivery_unit_price"], errors="coerce"
+        )
+      else:
+        d_sub["delivery_unit_price_n"] = pd.NA
       d_sub["total_deliv"] = (
           d_sub["uber_n"] + d_sub["rn_n"] + d_sub["demae_n"]
       )
       for d, grp in d_sub.groupby("date"):
+        explicit_counts = grp["delivery_count_n"].dropna()
+        explicit_prices = grp["delivery_unit_price_n"].dropna()
         deliv_dict[str(d).strip()] = {
             "deliv": int(grp["total_deliv"].sum()),
             "other": int(grp["other_n"].sum()),
+            "delivery_count": (
+                int(explicit_counts.sum())
+                if len(explicit_counts) == len(grp)
+                else None
+            ),
+            "delivery_unit_price": (
+                int(explicit_prices.iloc[0])
+                if len(explicit_prices) == len(grp)
+                else None
+            ),
         }
 
   # 3. 予約金の事前辞書化
@@ -860,9 +983,24 @@ def generate_month_df(
       total_other_sales = air_other_sales + deliv_item.get("other", 0)
 
     actual_sales = adjusted_air_sales + day_delivery_sales + total_other_sales
-    actual_cust = bp_item.get("actual_cust")
-    if actual_cust is None:
-      actual_cust = air_cust + estimate_delivery_count(day_delivery_sales)
+    store_cust = bp_item.get("actual_cust")
+    if store_cust is None:
+      store_cust = air_cust
+    delivery_count = (
+        bp_item.get("delivery_count")
+        if is_past_archive
+        else deliv_item.get("delivery_count")
+    )
+    if delivery_count is None:
+      delivery_count = estimate_delivery_count(day_delivery_sales)
+    delivery_unit_price = (
+        bp_item.get("delivery_unit_price")
+        if is_past_archive
+        else deliv_item.get("delivery_unit_price")
+    )
+    if delivery_unit_price is None:
+      delivery_unit_price = DELIVERY_UNIT_PRICE
+    actual_cust = store_cust + delivery_count
 
     # 売上比率
     prev_ratio = (
@@ -916,12 +1054,15 @@ def generate_month_df(
         "前年比": prev_ratio,
         "予算比": budget_ratio,
         "店頭売上": adjusted_air_sales,
-        "デリバリー売上": day_delivery_sales,
+        "D売上": day_delivery_sales,
+        "D件数": delivery_count,
+        "D単価": delivery_unit_price,
         "その他売上": total_other_sales,
         "予約金": day_res_deposit,
         "売上計上": day_res_sales,
         "前年客数": p_cust,
         "予算客数": b_cust,
+        "店頭客数": store_cust,
         "実績客数": actual_cust,
         "客数前年比": cust_prev_ratio,
         "客数予算比": cust_budget_ratio,
@@ -944,12 +1085,14 @@ def calculate_summary_rows(df_slot):
       "予算売上",
       "実績売上",
       "店頭売上",
-      "デリバリー売上",
+      "D売上",
+      "D件数",
       "その他売上",
       "予約金",
       "売上計上",
       "前年客数",
       "予算客数",
+      "店頭客数",
       "実績客数",
   ]
 
@@ -958,6 +1101,11 @@ def calculate_summary_rows(df_slot):
       col: int(pd.to_numeric(df_act[col], errors="coerce").fillna(0).sum())
       for col in num_cols
   }
+  sum_delivery_unit_price = int(
+      pd.to_numeric(df_act.loc[df_act["D売上"] != 0, "D単価"], errors="coerce")
+      .fillna(0)
+      .mean()
+  ) if (df_act["D売上"] != 0).any() else 0
   s_p_ratio = (
       f"{(sum_vals['実績売上'] / sum_vals['前年売上'] * 100):.1f}%"
       if sum_vals["前年売上"] > 0
@@ -1003,6 +1151,7 @@ def calculate_summary_rows(df_slot):
       "日": "合計",
       "曜日": "",
       **sum_vals,
+      "D単価": sum_delivery_unit_price,
       "前年比": s_p_ratio,
       "予算比": s_b_ratio,
       "客数前年比": s_c_ratio,
@@ -1019,6 +1168,7 @@ def calculate_summary_rows(df_slot):
       col: int(pd.to_numeric(df_act[col], errors="coerce").fillna(0).mean())
       for col in num_cols
   }
+  ave_delivery_unit_price = sum_delivery_unit_price
   a_p_ratio = (
       f"{(ave_vals['実績売上'] / ave_vals['前年売上'] * 100):.1f}%"
       if ave_vals["前年売上"] > 0
@@ -1064,6 +1214,7 @@ def calculate_summary_rows(df_slot):
       "日": "AVE",
       "曜日": "",
       **ave_vals,
+      "D単価": ave_delivery_unit_price,
       "前年比": a_p_ratio,
       "予算比": a_b_ratio,
       "客数前年比": a_c_ratio,
@@ -1119,6 +1270,7 @@ def calculate_summary_rows(df_slot):
       "日": "MIN",
       "曜日": "",
       **min_vals,
+      "D単価": int(pd.to_numeric(df_act["D単価"], errors="coerce").fillna(0).min()),
       "前年比": m_p_ratio,
       "予算比": m_b_ratio,
       "客数前年比": m_c_ratio,
@@ -1174,6 +1326,7 @@ def calculate_summary_rows(df_slot):
       "日": "MAX",
       "曜日": "",
       **max_vals,
+      "D単価": int(pd.to_numeric(df_act["D単価"], errors="coerce").fillna(0).max()),
       "前年比": mx_p_ratio,
       "予算比": mx_b_ratio,
       "客数前年比": mx_c_ratio,
@@ -1564,9 +1717,9 @@ with st.sidebar.expander("📥 売上データを取得する"):
               f"取得済みCSVはローカルに残っています: {e}"
           )
 
-  st.markdown("#### 実績客数をCSVから反映")
+  st.markdown("#### 店頭客数CSVを反映")
   customer_csv = st.file_uploader(
-        "実績客数CSV（date, store, time_slot, actual_cust）",
+        "店頭客数CSV（date, store, time_slot, actual_cust）",
         type=["csv"],
         key="actual_customer_csv_upload",
         help=(
@@ -1575,18 +1728,21 @@ with st.sidebar.expander("📥 売上データを取得する"):
         ),
   )
   if customer_csv and st.button(
-        "実績客数だけをスプレッドシートへ反映",
+        "店頭客数・D件数・D単価をスプレッドシートへ反映",
         key="update_actual_customer_csv_button",
   ):
     try:
-        updated_count, blank_count = update_actual_customer_column(customer_csv)
+        updated_count, blank_count, estimated_d_count = (
+            update_actual_customer_column(customer_csv)
+        )
         st.success(
-            f"実績客数を {updated_count - blank_count} 行反映しました。"
-            f"客数が空欄の {blank_count} 行は空欄のままです。"
+            f"店頭客数を {updated_count - blank_count} 行反映しました。"
+            f"空欄 {blank_count} 行は空欄のまま、"
+            f"D件数 {estimated_d_count:,} 件を反映しました。"
         )
         st.rerun()
     except Exception as e:
-        st.error(f"実績客数CSVを反映できませんでした: {e}")
+        st.error(f"店頭客数CSVを反映できませんでした: {e}")
 
   if st.button(
         "☁️ 取得済みCSVを年別シートに全同期",
@@ -1659,7 +1815,7 @@ if app_mode == "📱 店舗用（実績入力）":
   )
 
   tab_input, tab_manage = st.tabs(
-      ["📝 日次入力 (デリバリー / 予約)", "⚙️ 予約データの確認・修正・削除"]
+      ["📝 日次入力 (D売上 / 予約)", "⚙️ 予約データの確認・修正・削除"]
   )
 
   with tab_input:
@@ -1688,7 +1844,7 @@ if app_mode == "📱 店舗用（実績入力）":
     st.markdown("---")
 
     st.subheader(
-        f"🛵 1. デリバリー売上 【対象: {selected_date} / {selected_slot}】"
+        f"🛵 1. D売上 【対象: {selected_date} / {selected_slot}】"
     )
     just_saved_deliv = False
     if "msg_deliv" in st.session_state:
@@ -1796,7 +1952,7 @@ if app_mode == "📱 店舗用（実績入力）":
     else:
       st.markdown(f"💡 この時間帯の売上合計: **¥{total_delivery:,}**")
 
-    if st.button("💾 デリバリー売上を保存", type="primary"):
+    if st.button("💾 D売上を保存", type="primary"):
       save_delivery_data(
           selected_date,
           selected_store,
@@ -1808,7 +1964,7 @@ if app_mode == "📱 店舗用（実績入力）":
       )
       st.session_state["msg_deliv"] = (
           f"🎉 【{selected_date} /"
-          f" {selected_slot}】のデリバリー売上を保存しました！"
+          f" {selected_slot}】のD売上を保存しました！"
       )
       st.session_state["form_d_key"] += 1
       st.rerun()
@@ -2527,8 +2683,14 @@ else:
   )
   t_air, t_del, t_oth = (
       df_achieved["店頭売上"].sum(),
-      df_achieved["デリバリー売上"].sum(),
+      df_achieved["D売上"].sum(),
       df_achieved["その他売上"].sum(),
+  )
+  t_dcount = df_achieved["D件数"].sum()
+  t_dunit = (
+      int(df_achieved.loc[df_achieved["D売上"] != 0, "D単価"].mean())
+      if (df_achieved["D売上"] != 0).any()
+      else 0
   )
   t_res_dep, t_res_sales = (
       df_achieved["予約金"].sum(),
@@ -2539,6 +2701,7 @@ else:
       df_achieved["予算客数"].sum(),
       df_achieved["実績客数"].sum(),
   )
+  t_store_cust = df_achieved["店頭客数"].sum()
 
   tot_pprice = int(t_p / t_pc) if t_pc > 0 else 0
   tot_bprice = int(t_b / t_bc) if t_bc > 0 else 0
@@ -2562,12 +2725,15 @@ else:
       "予算売上": format_currency(t_b),
       "実績売上": format_currency(t_act),
       "店頭売上": format_currency(t_air),
-      "デリバリー売上": format_currency(t_del),
+      "D売上": format_currency(t_del),
+      "D件数": int(t_dcount),
+      "D単価": format_currency(t_dunit),
       "その他売上": format_currency(t_oth),
       "予約金": format_currency(t_res_dep),
       "売上計上": format_currency(t_res_sales),
       "前年客数": int(t_pc),
       "予算客数": int(t_bc),
+      "店頭客数": int(t_store_cust),
       "実績客数": int(t_ac),
       "客数前年比": cust_ratio_str,
       "客数予算比": cust_budget_ratio_str,
@@ -2646,7 +2812,8 @@ else:
                 "予算売上",
                 "実績売上",
                 "店頭売上",
-                "デリバリー売上",
+                "D売上",
+                "D単価",
                 "その他売上",
                 "予約金",
                 "売上計上",
@@ -2700,7 +2867,8 @@ else:
       "予算売上",
       "実績売上",
       "店頭売上",
-      "デリバリー売上",
+      "D売上",
+      "D単価",
       "その他売上",
       "予約金",
       "売上計上",
