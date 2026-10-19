@@ -11,6 +11,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit_gsheets import GSheetsConnection
 
 # ページ設定
@@ -95,6 +96,16 @@ def normalize_date_key(val):
 def estimate_delivery_count(delivery_sales):
   sales = max(0, parse_int(delivery_sales))
   return (sales + DELIVERY_UNIT_PRICE // 2) // DELIVERY_UNIT_PRICE
+
+
+def normalize_management_name(value):
+  if pd.isna(value):
+    return ""
+  if isinstance(value, (int, float)) and not isinstance(value, bool):
+    numeric_value = float(value)
+    if numeric_value.is_integer():
+      return str(int(numeric_value))
+  return str(value)
 
 
 def get_short_store_key(store_name):
@@ -328,6 +339,9 @@ def load_reservations():
     df = conn.read(worksheet="reservations", ttl=0).dropna(how="all")
     if not df.empty:
       df["id"] = df["id"].astype(str)
+      df["management_name"] = df["management_name"].apply(
+          normalize_management_name
+      )
       df["amount"] = (
           pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
       )
@@ -613,7 +627,7 @@ def save_reservation(
       "store": store,
       "date": date_str,
       "time_slot": time_slot,
-      "management_name": mng_name,
+      "management_name": str(mng_name),
       "amount": amount,
       "customer_name": cust_name,
       "phone": phone,
@@ -1773,6 +1787,30 @@ app_mode = st.sidebar.radio(
         "📄 報告書作成",
     ],
 )
+previous_app_mode = st.session_state.get("previous_app_mode")
+if (
+    app_mode == "📱 店舗用（実績入力）"
+    and previous_app_mode != app_mode
+):
+  components.html(
+      """
+      <script>
+        const scrollToTop = () => {
+          const doc = window.parent.document;
+          window.parent.scrollTo(0, 0);
+          const app = doc.querySelector('[data-testid="stAppViewContainer"]');
+          if (app) app.scrollTop = 0;
+          const main = doc.querySelector('section.main');
+          if (main) main.scrollTop = 0;
+        };
+        scrollToTop();
+        window.parent.requestAnimationFrame(scrollToTop);
+        window.parent.setTimeout(scrollToTop, 100);
+      </script>
+      """,
+      height=0,
+  )
+st.session_state["previous_app_mode"] = app_mode
 
 selected_store = st.session_state["selected_store"]
 selected_year_month = st.session_state["selected_year_month"]
@@ -1815,7 +1853,7 @@ if app_mode == "📱 店舗用（実績入力）":
   )
 
   tab_input, tab_manage = st.tabs(
-      ["📝 日次入力 (D売上 / 予約)", "⚙️ 予約データの確認・修正・削除"]
+      ["📝 日次入力 (デリバリー売上 / 予約)", "⚙️ 予約データの確認・修正・削除"]
   )
 
   with tab_input:
@@ -1844,7 +1882,7 @@ if app_mode == "📱 店舗用（実績入力）":
     st.markdown("---")
 
     st.subheader(
-        f"🛵 1. D売上 【対象: {selected_date} / {selected_slot}】"
+        f"🛵 1. デリバリー売上 【対象: {selected_date} / {selected_slot}】"
     )
     just_saved_deliv = False
     if "msg_deliv" in st.session_state:
@@ -1952,7 +1990,7 @@ if app_mode == "📱 店舗用（実績入力）":
     else:
       st.markdown(f"💡 この時間帯の売上合計: **¥{total_delivery:,}**")
 
-    if st.button("💾 D売上を保存", type="primary"):
+    if st.button("💾 デリバリー売上を保存", type="primary"):
       save_delivery_data(
           selected_date,
           selected_store,
@@ -1964,7 +2002,7 @@ if app_mode == "📱 店舗用（実績入力）":
       )
       st.session_state["msg_deliv"] = (
           f"🎉 【{selected_date} /"
-          f" {selected_slot}】のD売上を保存しました！"
+          f" {selected_slot}】のデリバリー売上を保存しました！"
       )
       st.session_state["form_d_key"] += 1
       st.rerun()
