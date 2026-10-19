@@ -60,6 +60,7 @@ STORE_CREDENTIALS = {
 
 STORES = list(STORE_CREDENTIALS.keys())
 TIME_SLOTS = ["早番", "中番", "遅番"]
+DELIVERY_UNIT_PRICE = 1800
 
 
 def normalize_time_slot(val):
@@ -88,6 +89,11 @@ def normalize_date_key(val):
     return ""
   parsed = pd.to_datetime(val, errors="coerce")
   return parsed.strftime("%Y-%m-%d") if pd.notna(parsed) else ""
+
+
+def estimate_delivery_count(delivery_sales):
+  sales = max(0, parse_int(delivery_sales))
+  return (sales + DELIVERY_UNIT_PRICE // 2) // DELIVERY_UNIT_PRICE
 
 
 def get_short_store_key(store_name):
@@ -733,7 +739,7 @@ def generate_month_df(
       total_other_sales = air_other_sales + deliv_item.get("other", 0)
 
     actual_sales = adjusted_air_sales + day_delivery_sales + total_other_sales
-    actual_cust = air_cust
+    actual_cust = air_cust + estimate_delivery_count(day_delivery_sales)
 
     # 売上比率
     prev_ratio = (
