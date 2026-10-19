@@ -1,282 +1,2467 @@
-from datetime import date
+import calendar
+from datetime import datetime
+import glob
+import io
 import os
 import re
+import subprocess
+import sys
+import uuid
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 import pandas as pd
+import streamlit as st
+from streamlit_gsheets import GSheetsConnection
 
-# ==========================================
-# 設定
-# ==========================================
-TARGET_DIR = r"C:\Users\YOSHIDA\airregi-automation\過去月報"
-OUTPUT_CSV = "app_sales_data.csv"
+# ページ設定
+st.set_page_config(
+    page_title="売上月報管理システム", page_icon="📊", layout="wide"
+)
 
-STORE_MAP = {
-    "三田": "三田おにぎり 本店",
-    "恵比寿": "おにぎり維心 恵比寿店",
-    "五反田": "おにぎり維心 五反田店",
-    "中目黒": "おにぎり維心 中目黒店",
+# スプレッドシートとの接続
+conn = st.connection("gsheets", type=GSheetsConnection)
+
+# Airレジからの取得データ(CSV)一時保存フォルダ
+OUTPUT_DIR = os.path.abspath("./output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# Airレジ専用スプレッドシートのURL取得（Secretsから）
+AIRREGI_SPREADSHEET_URL = None
+if "AIRREGI_SPREADSHEET" in st.secrets:
+  AIRREGI_SPREADSHEET_URL = str(st.secrets["AIRREGI_SPREADSHEET"])
+elif "connections" in st.secrets and "gsheets" in st.secrets["connections"]:
+  if "AIRREGI_SPREADSHEET" in st.secrets["connections"]["gsheets"]:
+    AIRREGI_SPREADSHEET_URL = str(
+        st.secrets["connections"]["gsheets"]["AIRREGI_SPREADSHEET"]
+    )
+
+# 店舗定義
+STORE_CREDENTIALS = {
+    "三田おにぎり 本店": {
+        "id": "001",
+        "pass": "0000",
+        "short_label": "三田店",
+    },
+    "おにぎり維心 恵比寿店": {
+        "id": "002",
+        "pass": "0000",
+        "short_label": "恵比寿店",
+    },
+    "おにぎり維心 五反田店": {
+        "id": "003",
+        "pass": "0000",
+        "short_label": "五反田店",
+    },
+    "おにぎり維心 中目黒店": {
+        "id": "004",
+        "pass": "0000",
+        "short_label": "中目黒店",
+    },
 }
 
-
-def clean_text(val):
-    if pd.isna(val):
-        return ""
-    return re.sub(r"[\s\u3000\xa0\ufeff]+", "", str(val))
+STORES = list(STORE_CREDENTIALS.keys())
+TIME_SLOTS = ["早番", "中番", "遅番"]
 
 
-def extract_year_month(file_path):
-    file_name = os.path.basename(file_path)
-    parent_dir = os.path.basename(os.path.dirname(file_path))
-
-    for text in [file_name, parent_dir]:
-        m = re.search(r"(202\d)[\.\-_年](\d{1,2})", text)
-        if m:
-            y, mo = int(m.group(1)), int(m.group(2))
-            if 1 <= mo <= 12:
-                return y, mo
-
-    matches = re.findall(r"(202\d)[\.\-_年](\d{1,2})", file_path)
-    for y_str, mo_str in reversed(matches):
-        y, mo = int(y_str), int(mo_str)
-        if 1 <= mo <= 12:
-            return y, mo
-    return None, None
+def normalize_time_slot(val):
+  s = str(val)
+  if "早" in s:
+    return "早番"
+  elif "中" in s:
+    return "中番"
+  elif "遅" in s:
+    return "遅番"
+  return s
 
 
-def detect_columns_by_order(df, start_row):
-    header_df = df.iloc[:start_row]
-    num_cols = len(df.columns)
+def parse_int(val):
+  if pd.isna(val):
+    return 0
+  clean_str = re.sub(r"[^\d-]", "", str(val))
+  try:
+    return int(clean_str)
+  except ValueError:
+    return 0
 
-    prev_cols = []
-    budget_cols = []
-    store_col = None
-    delivery_col = None
 
-    for c in range(num_cols):
-        col_cells = [
-            clean_text(header_df.iat[r, c]) for r in range(len(header_df))
+def get_short_store_key(store_name):
+  for key in ["三田", "恵比寿", "五反田", "中目黒"]:
+    if key in store_name:
+      return key
+  return store_name
+
+
+def match_slot_row(store_df, slot_name):
+  short_slot = slot_name[0] if slot_name else ""
+  return store_df[store_df[1].astype(str).str.contains(short_slot, na=False)]
+
+
+# --- キャッシュ付きデータロード関数群 ---
+@st.cache_data(ttl=600)
+def load_budget_prev_data():
+  try:
+    df = conn.read(worksheet="budget_prev", ttl=0).dropna(how="all")
+    if not df.empty:
+      df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
+    return df
+  except Exception:
+    return pd.DataFrame(
+        columns=[
+            "date",
+            "store",
+            "time_slot",
+            "budget_sales",
+            "prev_sales",
+            "prev_cust",
+            "budget_cust",
+            "store_sales",
+            "delivery_sales",
         ]
-        col_text = "_".join(col_cells)
-        col_text_lower = col_text.lower()
-
-        # 除外キーワード
-        is_ruikei = "累計" in col_text or "累前年" in col_text
-        is_jisseki = "実績" in col_text
-        is_hittatsu = "必達" in col_text or "店長" in col_text
-        is_rate = "達成率" in col_text
-        is_tanka = "単価" in col_text
-
-        # 1. 店頭売上（「店舗」または「本店」、ただし単価列は除外）
-        if (
-            ("店舗" in col_text or "本店" in col_text)
-            and not is_tanka
-            and store_col is None
-        ):
-            store_col = c
-
-        # 2. デリバリー売上（「uber」または「ubar」、ただし単価列は除外）
-        if (
-            ("uber" in col_text_lower or "ubar" in col_text_lower)
-            and not is_tanka
-            and delivery_col is None
-        ):
-            delivery_col = c
-
-        # 3. 前年・予算列の判定（構成・単価等は除外）
-        if is_ruikei or is_jisseki or is_hittatsu or is_rate or is_tanka:
-            continue
-
-        is_nichibetsu = "日別" in col_text
-
-        if "前年" in col_text and is_nichibetsu:
-            prev_cols.append(c)
-
-        if (
-            "予算" in col_text
-            and is_nichibetsu
-            and "日予算" not in col_text
-            and "累予算" not in col_text
-        ):
-            budget_cols.append(c)
-
-    col_map = {
-        "prev_sales": prev_cols[0] if len(prev_cols) >= 1 else None,
-        "prev_cust": prev_cols[1] if len(prev_cols) >= 2 else None,
-        "budget_sales": budget_cols[0] if len(budget_cols) >= 1 else None,
-        "budget_cust": budget_cols[1] if len(budget_cols) >= 2 else None,
-        "store_sales": store_col,
-        "delivery_sales": delivery_col,
-    }
-    return col_map
+    )
 
 
-# ==========================================
-# メイン処理
-# ==========================================
-records = []
-print("=" * 65)
-print(f"走査フォルダ: {TARGET_DIR}")
+@st.cache_data(ttl=600)
+def load_delivery_data():
+  try:
+    df = conn.read(worksheet="delivery_sales", ttl=0).dropna(how="all")
+    if not df.empty:
+      df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
+      if "rn" in df.columns and "rocket_now" not in df.columns:
+        df = df.rename(columns={"rn": "rocket_now"})
+      return df
+    return pd.DataFrame(
+        columns=[
+            "date",
+            "store",
+            "time_slot",
+            "uber",
+            "rocket_now",
+            "demaekan",
+            "other",
+        ]
+    )
+  except Exception:
+    return pd.DataFrame(
+        columns=[
+            "date",
+            "store",
+            "time_slot",
+            "uber",
+            "rocket_now",
+            "demaekan",
+            "other",
+        ]
+    )
 
-excel_files = []
-for root, _, files in os.walk(TARGET_DIR):
-    for f in files:
-        if f.startswith("~$"):
-            continue
-        ext = os.path.splitext(f)[1].lower()
-        if ext in [".xlsx", ".xlsb", ".xlsm"]:
-            excel_files.append(os.path.join(root, f))
 
-print(f"対象ファイル数: {len(excel_files)} 件")
-print("データ抽出を開始します...\n")
+@st.cache_data(ttl=600)
+def load_reservations():
+  try:
+    df = conn.read(worksheet="reservations", ttl=0).dropna(how="all")
+    if not df.empty:
+      df["id"] = df["id"].astype(str)
+      df["amount"] = (
+          pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
+      )
+      return df
+    return pd.DataFrame(
+        columns=[
+            "id",
+            "store",
+            "date",
+            "time_slot",
+            "management_name",
+            "amount",
+            "customer_name",
+            "phone",
+            "notes",
+        ]
+    )
+  except Exception:
+    return pd.DataFrame(
+        columns=[
+            "id",
+            "store",
+            "date",
+            "time_slot",
+            "management_name",
+            "amount",
+            "customer_name",
+            "phone",
+            "notes",
+        ]
+    )
 
-logged_sample = False
 
-for file_path in excel_files:
-    file_name = os.path.basename(file_path)
+@st.cache_data(ttl=600)
+def load_reservation_sales():
+  try:
+    df = conn.read(worksheet="reservation_sales", ttl=0).dropna(how="all")
+    if not df.empty:
+      df["id"] = df["id"].astype(str)
+      df["reservation_id"] = df["reservation_id"].astype(str)
+      df["amount"] = (
+          pd.to_numeric(df["amount"], errors="coerce").fillna(0).astype(int)
+      )
+      return df
+    return pd.DataFrame(
+        columns=["id", "reservation_id", "store", "date", "time_slot", "amount"]
+    )
+  except Exception:
+    return pd.DataFrame(
+        columns=["id", "reservation_id", "store", "date", "time_slot", "amount"]
+    )
 
-    matched_store = None
-    for kw, formal in STORE_MAP.items():
-        if kw in file_name:
-            matched_store = formal
-            break
-    if not matched_store:
-        continue
 
-    year, month = extract_year_month(file_path)
-    if not year or not month:
-        continue
+@st.cache_data(ttl=600)
+def get_airregi_sheet_for_year(year_str):
+  if not AIRREGI_SPREADSHEET_URL:
+    return pd.DataFrame()
+  try:
+    df = conn.read(
+        spreadsheet=AIRREGI_SPREADSHEET_URL, worksheet=str(year_str), ttl=0
+    ).dropna(how="all")
+    return df if not df.empty else pd.DataFrame()
+  except Exception:
+    return pd.DataFrame()
 
-    ext = os.path.splitext(file_name)[1].lower()
-    engine = "pyxlsb" if ext == ".xlsb" else "openpyxl"
 
-    try:
-        xl = pd.ExcelFile(file_path, engine=engine)
-        sheet_names = xl.sheet_names
-    except Exception:
-        continue
+def save_airregi_csv_to_sheets(target_date_str=None):
+  if not AIRREGI_SPREADSHEET_URL:
+    st.warning(
+        "⚠️ AIRREGI_SPREADSHEET の設定が見つかりません。Secretsを確認してください。"
+    )
+    return 0
 
-    for sheet in sheet_names:
-        clean_sheet = str(sheet).strip()
-        time_slot = None
-        if "早" in clean_sheet:
-            time_slot = "早番"
-        elif "中" in clean_sheet:
-            time_slot = "中番"
-        elif "遅" in clean_sheet:
-            time_slot = "遅番"
+  try:
+    pattern = (
+        os.path.join(OUTPUT_DIR, f"*{target_date_str}*.csv")
+        if target_date_str
+        else os.path.join(OUTPUT_DIR, "*.csv")
+    )
+    csv_files = glob.glob(pattern)
+    if not csv_files:
+      return 0
 
-        if not time_slot:
-            continue
+    files_by_year = {}
+    for f in csv_files:
+      m = re.search(r"(\d{4})-(\d{2}-\d{2})", os.path.basename(f))
+      if m:
+        year_str = m.group(1)
+        date_str = f"{year_str}-{m.group(2)}"
+        files_by_year.setdefault(year_str, []).append((date_str, f))
 
+    total_synced_dates = 0
+    for y_str, f_list in files_by_year.items():
+      new_records = []
+      for date_str, f_path in f_list:
         try:
-            df = pd.read_excel(
-                file_path, sheet_name=sheet, header=None, engine=engine
-            )
+          raw = pd.read_csv(f_path, header=None)
+          if raw.empty:
+            continue
+          if raw.shape[1] > 1:
+            raw = raw[
+                ~raw[1].astype(str).str.strip().isin(["時間帯", "現金"])
+            ]
+          if raw.empty:
+            continue
+          raw.insert(0, "date", date_str)
+          raw.columns = ["date"] + [f"c{i}" for i in range(raw.shape[1] - 1)]
+          new_records.append(raw)
         except Exception:
-            continue
+          continue
 
-        # 営業日列（1, 2...）とデータ開始行の検出
-        day_col = None
-        start_row = None
-        for r in range(min(10, len(df))):
-            for c in range(min(5, len(df.columns))):
-                v = df.iat[r, c]
-                try:
-                    if int(float(v)) == 1:
-                        if r + 1 < len(df) and int(float(df.iat[r + 1, c])) == 2:
-                            day_col = c
-                            start_row = r
-                            break
-                except (ValueError, TypeError):
-                    pass
-            if start_row is not None:
-                break
+      if not new_records:
+        continue
 
-        if start_row is None:
-            continue
+      year_new_df = pd.concat(new_records, ignore_index=True)
+      try:
+        current_sheet_df = conn.read(
+            spreadsheet=AIRREGI_SPREADSHEET_URL, worksheet=str(y_str), ttl=0
+        ).dropna(how="all")
+      except Exception:
+        current_sheet_df = pd.DataFrame()
 
-        col_map = detect_columns_by_order(df, start_row)
+      if not current_sheet_df.empty and "date" in current_sheet_df.columns:
+        if "c1" in current_sheet_df.columns:
+          current_sheet_df = current_sheet_df[
+              ~current_sheet_df["c1"]
+              .astype(str)
+              .str.strip()
+              .isin(["時間帯", "現金"])
+          ]
+        dates_to_replace = year_new_df["date"].unique()
+        kept_df = current_sheet_df[
+            ~current_sheet_df["date"].isin(dates_to_replace)
+        ]
+        final_df = pd.concat([kept_df, year_new_df], ignore_index=True)
+      else:
+        final_df = year_new_df
 
-        if not logged_sample:
-            print(f"【列判定確認】ファイル: {file_name}（{sheet}）")
-            print(
-                f"  -> 売上(前年): 列{col_map['prev_sales']}, 売上(予算): 列{col_map['budget_sales']}"
-            )
-            print(
-                f"  -> 客数(前年): 列{col_map['prev_cust']}, 客数(予算): 列{col_map['budget_cust']}"
-            )
-            print(
-                f"  -> 店頭売上(店舗/本店): 列{col_map['store_sales']}, デリバリー(Uber/Ubar): 列{col_map['delivery_sales']}"
-            )
-            print("-" * 65)
-            logged_sample = True
+      if "date" in final_df.columns:
+        sort_cols = ["date"]
+        if "c0" in final_df.columns:
+          sort_cols.append("c0")
+        final_df = final_df.sort_values(by=sort_cols).reset_index(drop=True)
 
-        for r in range(start_row, len(df)):
-            day_val = df.iat[r, day_col]
-            try:
-                if pd.isna(day_val):
-                    continue
-                d = int(float(day_val))
-                if not (1 <= d <= 31):
-                    continue
-                cur_date = date(year, month, d).strftime("%Y-%m-%d")
-            except (ValueError, TypeError):
-                continue
+      conn.update(
+          spreadsheet=AIRREGI_SPREADSHEET_URL,
+          worksheet=str(y_str),
+          data=final_df,
+      )
+      total_synced_dates += len(year_new_df["date"].unique())
 
-            def get_val(item_key):
-                target_c = col_map.get(item_key)
-                if target_c is None or target_c >= len(df.columns):
-                    return ""
-                try:
-                    val = df.iat[r, target_c]
-                    if pd.isna(val) or str(val).strip() in [
-                        "",
-                        "-",
-                        "#REF!",
-                        "#####",
-                    ]:
-                        return ""
-                    return int(round(float(val)))
-                except (ValueError, TypeError, IndexError):
-                    return ""
+    st.cache_data.clear()
+    return total_synced_dates
+  except Exception as e:
+    st.error(f"スプレッドシートへの保存中にエラーが発生しました: {e}")
+    return 0
 
-            records.append(
-                {
-                    "date": cur_date,
-                    "store": matched_store,
-                    "time_slot": time_slot,
-                    "budget_sales": get_val("budget_sales"),
-                    "prev_sales": get_val("prev_sales"),
-                    "prev_cust": get_val("prev_cust"),
-                    "budget_cust": get_val("budget_cust"),
-                    "store_sales": get_val("store_sales"),
-                    "delivery_sales": get_val("delivery_sales"),
-                }
-            )
 
-# 出力
-result_df = pd.DataFrame(records)
+def find_airregi_data_in_memory(date_str, df_year):
+  if df_year is not None and not df_year.empty and "date" in df_year.columns:
+    sub = df_year[df_year["date"].astype(str).str.strip() == date_str.strip()]
+    if not sub.empty:
+      sub_data = sub.drop(columns=["date"]).reset_index(drop=True)
+      sub_data.columns = range(sub_data.shape[1])
+      return sub_data
 
-print("=" * 65)
-if not result_df.empty:
-    slot_order = {"早番": 0, "中番": 1, "遅番": 2}
-    result_df["slot_rank"] = result_df["time_slot"].map(slot_order)
-    
-    # ★ここが重要：完全に重複を排除（1日・1店舗・1シフトにつき1行に絞る）
-    result_df = result_df.drop_duplicates(subset=["date", "store", "time_slot"], keep="first")
-    
-    result_df.sort_values(by=["date", "store", "slot_rank"], inplace=True)
-    result_df.drop(columns=["slot_rank"], inplace=True)
-
-    save_path = OUTPUT_CSV
+  d_dash = date_str
+  d_nodash = date_str.replace("-", "")
+  d_under = date_str.replace("-", "_")
+  all_files = glob.glob(os.path.join(OUTPUT_DIR, "*.csv"))
+  matched = [
+      f
+      for f in all_files
+      if d_dash in os.path.basename(f)
+      or d_nodash in os.path.basename(f)
+      or d_under in os.path.basename(f)
+  ]
+  if matched:
+    matched.sort(key=lambda x: os.path.getmtime(x), reverse=True)
     try:
-        result_df.to_csv(save_path, index=False, encoding="utf-8-sig")
-    except PermissionError:
-        save_path = "app_sales_data_new.csv"
-        result_df.to_csv(save_path, index=False, encoding="utf-8-sig")
-        print("※ app_sales_data.csv が開かれていたため、別名で保存しました。")
+      return pd.read_csv(matched[0], header=None)
+    except Exception:
+      pass
+  return None
 
-    print(f"【抽出成功！】 合計 {len(result_df)} 件のデータを抽出しました。")
-    print(f"保存先: {os.path.abspath(save_path)}")
+
+def get_available_months():
+  months = set()
+  display_year = st.session_state.get("display_year", str(datetime.now().year))
+
+  # 1. budget_prev から過去月を自動取得（2026年9月以前に対応）
+  bp_df_all = load_budget_prev_data()
+  if not bp_df_all.empty and "date" in bp_df_all.columns:
+    for d in bp_df_all["date"].dropna().astype(str):
+      m = re.search(r"(\d{4})-(\d{2})", d)
+      if m:
+        months.add(f"{m.group(1)}-{m.group(2)}")
+
+  # 2. Airレジシートから取得
+  df_cur_year = get_airregi_sheet_for_year(display_year)
+  if not df_cur_year.empty and "date" in df_cur_year.columns:
+    for d in df_cur_year["date"].dropna().astype(str):
+      m = re.search(r"(\d{4})-(\d{2})", d)
+      if m:
+        months.add(f"{m.group(1)}-{m.group(2)}")
+
+  # 3. CSVファイルから取得
+  all_files = glob.glob(os.path.join(OUTPUT_DIR, "*.csv"))
+  for f in all_files:
+    base = os.path.basename(f)
+    m = re.search(r"(\d{4})-(\d{2})-\d{2}", base)
+    if m:
+      months.add(f"{m.group(1)}-{m.group(2)}")
+
+  if not months:
+    return [f"{display_year}-10", f"{display_year}-01"]
+  return sorted(list(months), reverse=True)
+
+
+# --- 予約・デリバリー更新関数 ---
+def save_delivery_data(
+    date_str, store, time_slot, uber, rocket_now, demaekan, other
+):
+  df = load_delivery_data()
+  df = df[
+      ~(
+          (df["date"] == date_str)
+          & (df["store"] == store)
+          & (df["time_slot"] == time_slot)
+      )
+  ]
+  new_row = pd.DataFrame([{
+      "date": date_str,
+      "store": store,
+      "time_slot": time_slot,
+      "uber": uber,
+      "rocket_now": rocket_now,
+      "demaekan": demaekan,
+      "other": other,
+  }])
+  df = pd.concat([df, new_row], ignore_index=True)
+  conn.update(worksheet="delivery_sales", data=df)
+  load_delivery_data.clear()
+
+
+def save_reservation(
+    store, date_str, time_slot, mng_name, amount, cust_name, phone, notes
+):
+  df = load_reservations()
+  res_id = str(uuid.uuid4())
+  new_row = pd.DataFrame([{
+      "id": res_id,
+      "store": store,
+      "date": date_str,
+      "time_slot": time_slot,
+      "management_name": mng_name,
+      "amount": amount,
+      "customer_name": cust_name,
+      "phone": phone,
+      "notes": notes,
+  }])
+  df = pd.concat([df, new_row], ignore_index=True)
+  conn.update(worksheet="reservations", data=df)
+  load_reservations.clear()
+
+
+def update_reservation(
+    res_id, date_str, time_slot, mng_name, amount, cust_name, phone, notes
+):
+  df = load_reservations()
+  idx = df.index[df["id"] == res_id].tolist()
+  if idx:
+    df.at[idx[0], "date"] = date_str
+    df.at[idx[0], "time_slot"] = time_slot
+    df.at[idx[0], "management_name"] = str(mng_name)
+    df.at[idx[0], "amount"] = amount
+    df.at[idx[0], "customer_name"] = str(cust_name) if cust_name else ""
+    df.at[idx[0], "phone"] = str(phone) if phone else ""
+    df.at[idx[0], "notes"] = str(notes) if notes else ""
+    conn.update(worksheet="reservations", data=df)
+    load_reservations.clear()
+
+
+def delete_reservation(res_id):
+  df = load_reservations()
+  df = df[df["id"] != res_id]
+  conn.update(worksheet="reservations", data=df)
+  load_reservations.clear()
+
+  sales_df = load_reservation_sales()
+  if not sales_df.empty:
+    sales_df = sales_df[sales_df["reservation_id"] != res_id]
+    conn.update(worksheet="reservation_sales", data=sales_df)
+    load_reservation_sales.clear()
+
+
+def save_reservation_sale(res_id, store, date_str, time_slot, amount):
+  df = load_reservation_sales()
+  sale_id = str(uuid.uuid4())
+  new_row = pd.DataFrame([{
+      "id": sale_id,
+      "reservation_id": res_id,
+      "store": store,
+      "date": date_str,
+      "time_slot": time_slot,
+      "amount": amount,
+  }])
+  df = pd.concat([df, new_row], ignore_index=True)
+  conn.update(worksheet="reservation_sales", data=df)
+  load_reservation_sales.clear()
+
+
+def update_reservation_sale(sale_id, date_str, time_slot, amount):
+  df = load_reservation_sales()
+  idx = df.index[df["id"] == sale_id].tolist()
+  if idx:
+    df.at[idx[0], "date"] = date_str
+    df.at[idx[0], "time_slot"] = time_slot
+    df.at[idx[0], "amount"] = amount
+    conn.update(worksheet="reservation_sales", data=df)
+    load_reservation_sales.clear()
+
+
+def delete_reservation_sale(sale_id):
+  df = load_reservation_sales()
+  df = df[df["id"] != sale_id]
+  conn.update(worksheet="reservation_sales", data=df)
+  load_reservation_sales.clear()
+
+
+# --- 表生成関数（過去月報の店頭売上・デリバリー売上反映に対応） ---
+def generate_month_df(
+    selected_store,
+    year,
+    month,
+    target_slot_keyword,
+    bp_df,
+    deliv_df,
+    res_df,
+    res_sales_df,
+    airregi_df,
+):
+  _, max_days = calendar.monthrange(year, month)
+
+  # 1. 予算・前年・過去実績データの事前辞書化
+  bp_dict = {}
+  if not bp_df.empty:
+    bp_sub = bp_df[bp_df["store"] == selected_store]
+    if target_slot_keyword and not bp_sub.empty:
+      bp_sub = bp_sub[bp_sub["time_slot"] == target_slot_keyword]
+    if not bp_sub.empty:
+      b_cust_col = None
+      for c in ["budget_cust", "予算客数", "b_cust", "budget_customers"]:
+        if c in bp_sub.columns:
+          b_cust_col = c
+          break
+
+      s_sales_col = None
+      for c in [
+          "store_sales",
+          "店頭売上",
+          "店舗売上",
+          "本店売上",
+          "store_sale",
+      ]:
+        if c in bp_sub.columns:
+          s_sales_col = c
+          break
+
+      d_sales_col = None
+      for c in ["delivery_sales", "デリバリー売上", "uber_sales", "uber"]:
+        if c in bp_sub.columns:
+          d_sales_col = c
+          break
+
+      for d, grp in bp_sub.groupby("date"):
+        b_cust_val = parse_int(grp[b_cust_col].sum()) if b_cust_col else 0
+        s_sales_val = parse_int(grp[s_sales_col].sum()) if s_sales_col else 0
+        d_sales_val = parse_int(grp[d_sales_col].sum()) if d_sales_col else 0
+        bp_dict[str(d).strip()] = {
+            "prev_sales": parse_int(grp["prev_sales"].sum()),
+            "budget_sales": parse_int(grp["budget_sales"].sum()),
+            "prev_cust": parse_int(grp["prev_cust"].sum()),
+            "budget_cust": b_cust_val,
+            "store_sales": s_sales_val,
+            "delivery_sales": d_sales_val,
+        }
+
+  # 2. デリバリー売上の事前辞書化
+  deliv_dict = {}
+  if not deliv_df.empty:
+    d_sub = deliv_df[deliv_df["store"] == selected_store]
+    if target_slot_keyword and not d_sub.empty:
+      d_sub = d_sub[d_sub["time_slot"] == target_slot_keyword]
+    if not d_sub.empty:
+      d_sub = d_sub.copy()
+      d_sub["uber_n"] = pd.to_numeric(d_sub["uber"], errors="coerce").fillna(0)
+      d_sub["rn_n"] = pd.to_numeric(
+          d_sub["rocket_now"], errors="coerce"
+      ).fillna(0)
+      d_sub["demae_n"] = pd.to_numeric(
+          d_sub["demaekan"], errors="coerce"
+      ).fillna(0)
+      d_sub["other_n"] = pd.to_numeric(d_sub["other"], errors="coerce").fillna(
+          0
+      )
+      d_sub["total_deliv"] = (
+          d_sub["uber_n"] + d_sub["rn_n"] + d_sub["demae_n"]
+      )
+      for d, grp in d_sub.groupby("date"):
+        deliv_dict[str(d).strip()] = {
+            "deliv": int(grp["total_deliv"].sum()),
+            "other": int(grp["other_n"].sum()),
+        }
+
+  # 3. 予約金の事前辞書化
+  res_dict = {}
+  if not res_df.empty:
+    r_sub = res_df[res_df["store"] == selected_store]
+    if target_slot_keyword and not r_sub.empty:
+      r_sub = r_sub[
+          (r_sub["time_slot"] == target_slot_keyword)
+          | (r_sub["time_slot"] == "時間帯未指定")
+      ]
+    if not r_sub.empty:
+      r_sub = r_sub.copy()
+      r_sub["amount_n"] = pd.to_numeric(r_sub["amount"], errors="coerce").fillna(
+          0
+      )
+      for d, grp in r_sub.groupby("date"):
+        res_dict[str(d).strip()] = -int(grp["amount_n"].sum())
+
+  # 4. 売上計上の事前辞書化
+  res_sales_dict = {}
+  if not res_sales_df.empty:
+    rs_sub = res_sales_df[res_sales_df["store"] == selected_store]
+    if target_slot_keyword and not rs_sub.empty:
+      rs_sub = rs_sub[rs_sub["time_slot"] == target_slot_keyword]
+    if not rs_sub.empty:
+      rs_sub = rs_sub.copy()
+      rs_sub["amount_n"] = pd.to_numeric(
+          rs_sub["amount"], errors="coerce"
+      ).fillna(0)
+      for d, grp in rs_sub.groupby("date"):
+        res_sales_dict[str(d).strip()] = int(grp["amount_n"].sum())
+
+  # 5. Airレジデータの事前辞書化
+  air_dict = {}
+  if (
+      airregi_df is not None
+      and not airregi_df.empty
+      and "date" in airregi_df.columns
+  ):
+    short_key = get_short_store_key(selected_store)
+    c_store = "c0" if "c0" in airregi_df.columns else airregi_df.columns[1]
+    c_slot = "c1" if "c1" in airregi_df.columns else airregi_df.columns[2]
+    c_sales = "c2" if "c2" in airregi_df.columns else airregi_df.columns[3]
+    c_cust = "c5" if "c5" in airregi_df.columns else airregi_df.columns[6]
+    c_other = (
+        "c11"
+        if "c11" in airregi_df.columns
+        else (
+            airregi_df.columns[12] if len(airregi_df.columns) > 12 else None
+        )
+    )
+
+    store_air = airregi_df[
+        airregi_df[c_store].astype(str).str.contains(short_key, na=False)
+    ]
+    if target_slot_keyword is None:
+      matched_air = store_air[
+          store_air[c_slot].astype(str).str.strip() == "合計"
+      ]
+    else:
+      matched_air = store_air[
+          store_air[c_slot]
+          .astype(str)
+          .str.contains(target_slot_keyword[0], na=False)
+      ]
+
+    for _, row in matched_air.iterrows():
+      d_key = str(row["date"]).strip()
+      a_sales = parse_int(row[c_sales])
+      a_cust = parse_int(row[c_cust])
+      a_oth = (
+          parse_int(row[c_other])
+          if c_other and pd.notna(row.get(c_other))
+          else 0
+      )
+      air_dict[d_key] = (a_sales, a_cust, a_oth)
+
+  weekday_kanji_list = ["月", "火", "水", "木", "金", "土", "日"]
+  rows = []
+
+  for day in range(1, max_days + 1):
+    date_str = f"{year:04d}-{month:02d}-{day:02d}"
+
+    bp_item = bp_dict.get(date_str, {})
+    p_sales = bp_item.get("prev_sales", 0)
+    b_sales = bp_item.get("budget_sales", 0)
+    p_cust = bp_item.get("prev_cust", 0)
+    b_cust = bp_item.get("budget_cust", 0)
+
+    # 過去データ判定（2026年9月以前は過去月報の数値を優先反映）
+    is_past_archive = date_str < "2026-10-01"
+
+    air_sales, air_cust, air_other_sales = 0, 0, 0
+    if date_str in air_dict:
+      air_sales, air_cust, air_other_sales = air_dict[date_str]
+    else:
+      raw_df = find_airregi_data_in_memory(date_str, airregi_df)
+      if raw_df is not None:
+        try:
+          short_key = get_short_store_key(selected_store)
+          store_df = raw_df[
+              raw_df[0].astype(str).str.contains(short_key, na=False)
+          ]
+          matched = (
+              store_df[store_df[1].astype(str).str.strip() == "合計"]
+              if target_slot_keyword is None
+              else match_slot_row(store_df, target_slot_keyword)
+          )
+          if not matched.empty:
+            air_sales = parse_int(matched.iloc[0, 2])
+            air_cust = parse_int(matched.iloc[0, 5])
+            if matched.shape[1] > 11:
+              air_other_sales = parse_int(matched.iloc[0, 11])
+        except Exception:
+          pass
+
+    deliv_item = deliv_dict.get(date_str, {})
+    day_res_deposit = res_dict.get(date_str, 0)
+    day_res_sales = res_sales_dict.get(date_str, 0)
+
+    # 店頭売上とデリバリー売上の決定
+    if is_past_archive and (
+        "store_sales" in bp_item or "delivery_sales" in bp_item
+    ):
+      adjusted_air_sales = bp_item.get("store_sales", 0)
+      day_delivery_sales = bp_item.get("delivery_sales", 0)
+      total_other_sales = 0
+    else:
+      adjusted_air_sales = air_sales + day_res_deposit + day_res_sales
+      day_delivery_sales = deliv_item.get("deliv", 0)
+      total_other_sales = air_other_sales + deliv_item.get("other", 0)
+
+    actual_sales = adjusted_air_sales + day_delivery_sales + total_other_sales
+    actual_cust = air_cust
+
+    # 売上比率
+    prev_ratio = (
+        f"{(actual_sales / p_sales * 100):.1f}%"
+        if p_sales > 0 and actual_sales != 0
+        else ("-" if actual_sales == 0 else "0.0%")
+    )
+    budget_ratio = (
+        f"{(actual_sales / b_sales * 100):.1f}%"
+        if b_sales > 0 and actual_sales != 0
+        else ("-" if actual_sales == 0 else "0.0%")
+    )
+
+    # 単価計算
+    p_price = int(p_sales / p_cust) if p_cust > 0 else 0
+    b_price = int(b_sales / b_cust) if b_cust > 0 else 0
+    a_price = int(actual_sales / actual_cust) if actual_cust > 0 else 0
+
+    # 稼働（客数）比率
+    cust_prev_ratio = (
+        f"{(actual_cust / p_cust * 100):.1f}%"
+        if p_cust > 0 and actual_cust > 0
+        else "-"
+    )
+    cust_budget_ratio = (
+        f"{(actual_cust / b_cust * 100):.1f}%"
+        if b_cust > 0 and actual_cust > 0
+        else "-"
+    )
+
+    # 客単価比率
+    price_prev_ratio = (
+        f"{(a_price / p_price * 100):.1f}%"
+        if p_price > 0 and a_price != 0
+        else "-"
+    )
+    price_budget_ratio = (
+        f"{(a_price / b_price * 100):.1f}%"
+        if b_price > 0 and a_price != 0
+        else "-"
+    )
+
+    weekday_kanji = weekday_kanji_list[pd.to_datetime(date_str).weekday()]
+
+    rows.append({
+        "日": day,
+        "曜日": weekday_kanji,
+        "前年売上": p_sales,
+        "予算売上": b_sales,
+        "実績売上": actual_sales,
+        "前年比": prev_ratio,
+        "予算比": budget_ratio,
+        "店頭売上": adjusted_air_sales,
+        "デリバリー売上": day_delivery_sales,
+        "その他売上": total_other_sales,
+        "予約金": day_res_deposit,
+        "売上計上": day_res_sales,
+        "前年客数": p_cust,
+        "予算客数": b_cust,
+        "実績客数": actual_cust,
+        "客数前年比": cust_prev_ratio,
+        "客数予算比": cust_budget_ratio,
+        "前年単価": p_price,
+        "予算単価": b_price,
+        "実績単価": a_price,
+        "単価前年比": price_prev_ratio,
+        "単価予算比": price_budget_ratio,
+    })
+
+  return pd.DataFrame(rows)
+
+
+def calculate_summary_rows(df_slot):
+  df_act = df_slot[df_slot["実績売上"] != 0]
+  if df_act.empty:
+    df_act = df_slot.iloc[:1]
+  num_cols = [
+      "前年売上",
+      "予算売上",
+      "実績売上",
+      "店頭売上",
+      "デリバリー売上",
+      "その他売上",
+      "予約金",
+      "売上計上",
+      "前年客数",
+      "予算客数",
+      "実績客数",
+  ]
+
+  # 合計
+  sum_vals = {
+      col: int(pd.to_numeric(df_act[col], errors="coerce").fillna(0).sum())
+      for col in num_cols
+  }
+  s_p_ratio = (
+      f"{(sum_vals['実績売上'] / sum_vals['前年売上'] * 100):.1f}%"
+      if sum_vals["前年売上"] > 0
+      else "-"
+  )
+  s_b_ratio = (
+      f"{(sum_vals['実績売上'] / sum_vals['予算売上'] * 100):.1f}%"
+      if sum_vals["予算売上"] > 0
+      else "-"
+  )
+  s_c_ratio = (
+      f"{(sum_vals['実績客数'] / sum_vals['前年客数'] * 100):.1f}%"
+      if sum_vals["前年客数"] > 0
+      else "-"
+  )
+  s_cb_ratio = (
+      f"{(sum_vals['実績客数'] / sum_vals['予算客数'] * 100):.1f}%"
+      if sum_vals["予算客数"] > 0
+      else "-"
+  )
+  s_p_price = (
+      int(sum_vals["前年売上"] / sum_vals["前年客数"])
+      if sum_vals["前年客数"] > 0
+      else 0
+  )
+  s_b_price = (
+      int(sum_vals["予算売上"] / sum_vals["予算客数"])
+      if sum_vals["予算客数"] > 0
+      else 0
+  )
+  s_a_price = (
+      int(sum_vals["実績売上"] / sum_vals["実績客数"])
+      if sum_vals["実績客数"] > 0
+      else 0
+  )
+  s_pr_ratio = (
+      f"{(s_a_price / s_p_price * 100):.1f}%" if s_p_price > 0 else "-"
+  )
+  s_prb_ratio = (
+      f"{(s_a_price / s_b_price * 100):.1f}%" if s_b_price > 0 else "-"
+  )
+  row_sum = {
+      "日": "合計",
+      "曜日": "",
+      **sum_vals,
+      "前年比": s_p_ratio,
+      "予算比": s_b_ratio,
+      "客数前年比": s_c_ratio,
+      "客数予算比": s_cb_ratio,
+      "前年単価": s_p_price,
+      "予算単価": s_b_price,
+      "実績単価": s_a_price,
+      "単価前年比": s_pr_ratio,
+      "単価予算比": s_prb_ratio,
+  }
+
+  # 平均
+  ave_vals = {
+      col: int(pd.to_numeric(df_act[col], errors="coerce").fillna(0).mean())
+      for col in num_cols
+  }
+  a_p_ratio = (
+      f"{(ave_vals['実績売上'] / ave_vals['前年売上'] * 100):.1f}%"
+      if ave_vals["前年売上"] > 0
+      else "-"
+  )
+  a_b_ratio = (
+      f"{(ave_vals['実績売上'] / ave_vals['予算売上'] * 100):.1f}%"
+      if ave_vals["予算売上"] > 0
+      else "-"
+  )
+  a_c_ratio = (
+      f"{(ave_vals['実績客数'] / ave_vals['前年客数'] * 100):.1f}%"
+      if ave_vals["前年客数"] > 0
+      else "-"
+  )
+  a_cb_ratio = (
+      f"{(ave_vals['実績客数'] / ave_vals['予算客数'] * 100):.1f}%"
+      if ave_vals["予算客数"] > 0
+      else "-"
+  )
+  a_p_price = (
+      int(ave_vals["前年売上"] / ave_vals["前年客数"])
+      if ave_vals["前年客数"] > 0
+      else 0
+  )
+  a_b_price = (
+      int(ave_vals["予算売上"] / ave_vals["予算客数"])
+      if ave_vals["予算客数"] > 0
+      else 0
+  )
+  a_a_price = (
+      int(ave_vals["実績売上"] / ave_vals["実績客数"])
+      if ave_vals["実績客数"] > 0
+      else 0
+  )
+  a_pr_ratio = (
+      f"{(a_a_price / a_p_price * 100):.1f}%" if a_p_price > 0 else "-"
+  )
+  a_prb_ratio = (
+      f"{(a_a_price / a_b_price * 100):.1f}%" if a_b_price > 0 else "-"
+  )
+  row_ave = {
+      "日": "AVE",
+      "曜日": "",
+      **ave_vals,
+      "前年比": a_p_ratio,
+      "予算比": a_b_ratio,
+      "客数前年比": a_c_ratio,
+      "客数予算比": a_cb_ratio,
+      "前年単価": a_p_price,
+      "予算単価": a_b_price,
+      "実績単価": a_a_price,
+      "単価前年比": a_pr_ratio,
+      "単価予算比": a_prb_ratio,
+  }
+
+  # 最小
+  min_vals = {
+      col: int(pd.to_numeric(df_act[col], errors="coerce").fillna(0).min())
+      for col in num_cols
+  }
+  m_p_ratio = (
+      f"{(min_vals['実績売上'] / min_vals['前年売上'] * 100):.1f}%"
+      if min_vals["前年売上"] > 0
+      else "-"
+  )
+  m_b_ratio = (
+      f"{(min_vals['実績売上'] / min_vals['予算売上'] * 100):.1f}%"
+      if min_vals["予算売上"] > 0
+      else "-"
+  )
+  m_c_ratio = (
+      f"{(min_vals['実績客数'] / min_vals['前年客数'] * 100):.1f}%"
+      if min_vals["前年客数"] > 0
+      else "-"
+  )
+  m_cb_ratio = (
+      f"{(min_vals['実績客数'] / min_vals['予算客数'] * 100):.1f}%"
+      if min_vals["予算客数"] > 0
+      else "-"
+  )
+  m_p_price = int(
+      pd.to_numeric(df_act["前年単価"], errors="coerce").fillna(0).min()
+  )
+  m_b_price = int(
+      pd.to_numeric(df_act["予算単価"], errors="coerce").fillna(0).min()
+  )
+  m_a_price = int(
+      pd.to_numeric(df_act["実績単価"], errors="coerce").fillna(0).min()
+  )
+  m_pr_ratio = (
+      f"{(m_a_price / m_p_price * 100):.1f}%" if m_p_price > 0 else "-"
+  )
+  m_prb_ratio = (
+      f"{(m_a_price / m_b_price * 100):.1f}%" if m_b_price > 0 else "-"
+  )
+  row_min = {
+      "日": "MIN",
+      "曜日": "",
+      **min_vals,
+      "前年比": m_p_ratio,
+      "予算比": m_b_ratio,
+      "客数前年比": m_c_ratio,
+      "客数予算比": m_cb_ratio,
+      "前年単価": m_p_price,
+      "予算単価": m_b_price,
+      "実績単価": m_a_price,
+      "単価前年比": m_pr_ratio,
+      "単価予算比": m_prb_ratio,
+  }
+
+  # 最大
+  max_vals = {
+      col: int(pd.to_numeric(df_act[col], errors="coerce").fillna(0).max())
+      for col in num_cols
+  }
+  mx_p_ratio = (
+      f"{(max_vals['実績売上'] / max_vals['前年売上'] * 100):.1f}%"
+      if max_vals["前年売上"] > 0
+      else "-"
+  )
+  mx_b_ratio = (
+      f"{(max_vals['実績売上'] / max_vals['予算売上'] * 100):.1f}%"
+      if max_vals["予算売上"] > 0
+      else "-"
+  )
+  mx_c_ratio = (
+      f"{(max_vals['実績客数'] / max_vals['前年客数'] * 100):.1f}%"
+      if max_vals["前年客数"] > 0
+      else "-"
+  )
+  mx_cb_ratio = (
+      f"{(max_vals['実績客数'] / max_vals['予算客数'] * 100):.1f}%"
+      if max_vals["予算客数"] > 0
+      else "-"
+  )
+  mx_p_price = int(
+      pd.to_numeric(df_act["前年単価"], errors="coerce").fillna(0).max()
+  )
+  mx_b_price = int(
+      pd.to_numeric(df_act["予算単価"], errors="coerce").fillna(0).max()
+  )
+  mx_a_price = int(
+      pd.to_numeric(df_act["実績単価"], errors="coerce").fillna(0).max()
+  )
+  mx_pr_ratio = (
+      f"{(mx_a_price / mx_p_price * 100):.1f}%" if mx_p_price > 0 else "-"
+  )
+  mx_prb_ratio = (
+      f"{(mx_a_price / mx_b_price * 100):.1f}%" if mx_b_price > 0 else "-"
+  )
+  row_max = {
+      "日": "MAX",
+      "曜日": "",
+      **max_vals,
+      "前年比": mx_p_ratio,
+      "予算比": mx_b_ratio,
+      "客数前年比": mx_c_ratio,
+      "客数予算比": mx_cb_ratio,
+      "前年単価": mx_p_price,
+      "予算単価": mx_b_price,
+      "実績単価": mx_a_price,
+      "単価前年比": mx_pr_ratio,
+      "単価予算比": mx_prb_ratio,
+  }
+
+  return [row_sum, row_ave, row_min, row_max]
+
+
+def create_multi_sheet_excel(
+    selected_store,
+    year,
+    month,
+    bp_df,
+    deliv_df,
+    res_df,
+    res_sales_df,
+    airregi_df,
+):
+  output = io.BytesIO()
+  slots = [("合計", None), ("早番", "早番"), ("中番", "中番"), ("遅番", "遅番")]
+
+  header_fill = PatternFill(
+      start_color="1F4E78", end_color="1F4E78", fill_type="solid"
+  )
+  header_font = Font(name="游ゴシック", size=11, bold=True, color="FFFFFF")
+  total_row_fill = PatternFill(
+      start_color="1F4E78", end_color="1F4E78", fill_type="solid"
+  )
+  total_row_font = Font(name="游ゴシック", size=11, bold=True, color="FFFFFF")
+  even_row_fill = PatternFill(
+      start_color="F2F4F7", end_color="F2F4F7", fill_type="solid"
+  )
+  odd_row_fill = PatternFill(
+      start_color="FFFFFF", end_color="FFFFFF", fill_type="solid"
+  )
+  data_font = Font(name="游ゴシック", size=10)
+  summary_label_font = Font(name="游ゴシック", size=10, bold=True)
+  center_alignment = Alignment(horizontal="center", vertical="center")
+  thin_border = Border(
+      left=Side(style="thin", color="D9D9D9"),
+      right=Side(style="thin", color="D9D9D9"),
+      top=Side(style="thin", color="D9D9D9"),
+      bottom=Side(style="thin", color="D9D9D9"),
+  )
+
+  with pd.ExcelWriter(output, engine="openpyxl") as writer:
+    workbook = writer.book
+    for sheet_name, slot_kw in slots:
+      df_slot = generate_month_df(
+          selected_store,
+          year,
+          month,
+          slot_kw,
+          bp_df,
+          deliv_df,
+          res_df,
+          res_sales_df,
+          airregi_df,
+      )
+      cols = list(df_slot.columns)
+      ws = workbook.create_sheet(title=sheet_name)
+
+      ws.cell(
+          row=1,
+          column=1,
+          value=f"{selected_store} {year}年{month}月度（{sheet_name}）",
+      ).font = Font(
+          name="游ゴシック", size=13, bold=True, color="1F4E78"
+      )
+
+      for col_idx, col_name in enumerate(cols, start=1):
+        cell = ws.cell(row=3, column=col_idx)
+        cell.value = (
+            "合計" if col_idx == 1 else ("" if col_idx == 2 else col_name)
+        )
+        cell.fill, cell.font, cell.alignment, cell.border = (
+            header_fill,
+            header_font,
+            center_alignment,
+            thin_border,
+        )
+
+      for s_idx, s_row in enumerate(calculate_summary_rows(df_slot), start=4):
+        is_total_row = s_row.get("日") == "合計"
+        fill = (
+            total_row_fill
+            if is_total_row
+            else (even_row_fill if s_idx % 2 == 0 else odd_row_fill)
+        )
+        font = total_row_font if is_total_row else data_font
+
+        for col_idx, col_name in enumerate(cols, start=1):
+          cell = ws.cell(row=s_idx, column=col_idx)
+          val = s_row.get(col_name, "")
+          if col_idx == 1:
+            cell.value = "" if is_total_row else val
+            cell.font = total_row_font if is_total_row else summary_label_font
+          elif col_idx == 2:
+            cell.value = ""
+          else:
+            cell.value = val
+            cell.font = font
+          cell.fill, cell.alignment, cell.border = (
+              fill,
+              center_alignment,
+              thin_border,
+          )
+
+      ws.merge_cells("A3:B4")
+      ws.merge_cells("A5:B5")
+      ws.merge_cells("A6:B6")
+      ws.merge_cells("A7:B7")
+
+      for col_idx, col_name in enumerate(cols, start=1):
+        cell = ws.cell(row=9, column=col_idx, value=col_name)
+        cell.fill, cell.font, cell.alignment, cell.border = (
+            header_fill,
+            header_font,
+            center_alignment,
+            thin_border,
+        )
+
+      for r_idx, row_data in enumerate(
+          df_slot.to_dict(orient="records"), start=10
+      ):
+        fill = even_row_fill if r_idx % 2 == 0 else odd_row_fill
+        for col_idx, col_name in enumerate(cols, start=1):
+          cell = ws.cell(row=r_idx, column=col_idx, value=row_data[col_name])
+          cell.fill, cell.font, cell.alignment, cell.border = (
+              fill,
+              data_font,
+              center_alignment,
+              thin_border,
+          )
+
+      ws.column_dimensions["A"].width, ws.column_dimensions["B"].width = 8, 8
+      for col in list(ws.columns)[2:]:
+        max_len = max(len(str(cell.value or "")) for cell in list(col)[2:])
+        ws.column_dimensions[col[0].column_letter].width = max(max_len + 4, 12)
+
+    if "Sheet" in workbook.sheetnames:
+      workbook.remove(workbook["Sheet"])
+  return output.getvalue()
+
+
+current_year_num = datetime.now().year
+available_years = [
+    str(y) for y in range(current_year_num, current_year_num - 11, -1)
+]
+
+if "selected_store" not in st.session_state:
+  st.session_state["selected_store"] = STORES[0]
+if "display_year" not in st.session_state:
+  st.session_state["display_year"] = str(current_year_num)
+if "target_date_state" not in st.session_state:
+  st.session_state["target_date_state"] = datetime.now().date()
+
+if "form_d_key" not in st.session_state:
+  st.session_state["form_d_key"] = 0
+if "form_r_key" not in st.session_state:
+  st.session_state["form_r_key"] = 0
+if "form_s_key" not in st.session_state:
+  st.session_state["form_s_key"] = 0
+
+
+def prev_year_action():
+  idx = (
+      available_years.index(st.session_state["display_year"])
+      if st.session_state["display_year"] in available_years
+      else 0
+  )
+  if idx < len(available_years) - 1:
+    st.session_state["display_year"] = available_years[idx + 1]
+    m = get_available_months()
+    if m:
+      st.session_state["selected_year_month"] = m[0]
+
+
+def next_year_action():
+  idx = (
+      available_years.index(st.session_state["display_year"])
+      if st.session_state["display_year"] in available_years
+      else 0
+  )
+  if idx > 0:
+    st.session_state["display_year"] = available_years[idx - 1]
+    m = get_available_months()
+    if m:
+      st.session_state["selected_year_month"] = m[0]
+
+
+st.sidebar.title("メニュー")
+st.sidebar.markdown("---")
+st.sidebar.subheader("店舗・期間設定")
+st.sidebar.selectbox("閲覧店舗", STORES, key="selected_store")
+
+st.sidebar.markdown("対象年")
+col_prev, col_year, col_next = st.sidebar.columns([1, 2, 1])
+with col_prev:
+  st.button("◀", key="prev_year", on_click=prev_year_action)
+with col_year:
+  st.markdown(
+      f"<div style='text-align: center; padding-top: 5px; font-weight: bold;"
+      f" font-size: 18px;'>{st.session_state['display_year']}年</div>",
+      unsafe_allow_html=True,
+  )
+with col_next:
+  st.button("▶", key="next_year", on_click=next_year_action)
+
+display_year = st.session_state["display_year"]
+available_months = get_available_months()
+months_in_year = [
+    m for m in available_months if m.startswith(display_year)
+] or [f"{display_year}-10", f"{display_year}-01"]
+st.sidebar.selectbox("対象月", months_in_year, key="selected_year_month")
+
+# --- 売上データ取得ブロック ---
+with st.sidebar.expander("📥 売上データを取得する"):
+  target_date = st.date_input(
+      "取得日", value=datetime.now().date(), key="fetch_date_input_sidebar"
+  )
+  if st.button("🚀 取得実行", type="primary"):
+    target_str = target_date.strftime("%Y-%m-%d")
+    with st.spinner(f"{target_str} 取得中... (完了までお待ちください)"):
+      try:
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True,
+            check=True,
+        )
+
+        custom_env = os.environ.copy()
+        air_id = None
+        air_pass = None
+
+        if "AIRREGI_ID" in st.secrets:
+          air_id = st.secrets["AIRREGI_ID"]
+        if "AIRREGI_PASS" in st.secrets:
+          air_pass = st.secrets["AIRREGI_PASS"]
+
+        if (
+            not air_id
+            and "connections" in st.secrets
+            and "gsheets" in st.secrets["connections"]
+        ):
+          gsheets_sec = st.secrets["connections"]["gsheets"]
+          if "AIRREGI_ID" in gsheets_sec:
+            air_id = gsheets_sec["AIRREGI_ID"]
+          if "AIRREGI_PASS" in gsheets_sec:
+            air_pass = gsheets_sec["AIRREGI_PASS"]
+
+        if air_id:
+          custom_env["AIRREGI_ID"] = str(air_id)
+        if air_pass:
+          custom_env["AIRREGI_PASS"] = str(air_pass)
+
+        res = subprocess.run(
+            [
+                sys.executable,
+                "get_monthly_data.py",
+                target_str,
+                target_str,
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=custom_env,
+            check=True,
+        )
+
+        n = save_airregi_csv_to_sheets(target_str)
+        st.success(f"🎉 取得＆スプレッドシートへ保存完了！（{target_str}）")
+        st.rerun()
+
+      except subprocess.CalledProcessError as e:
+        st.error("⚠️ データ取得処理でエラーが発生しました。")
+        err_detail = ""
+        if e.stderr:
+          err_detail += f"【標準エラー】:\n{e.stderr}\n\n"
+        if e.stdout:
+          err_detail += f"【標準出力】:\n{e.stdout}"
+        st.code(
+            err_detail if err_detail else "エラーメッセージはありませんでした。",
+            language="text",
+        )
+        if os.path.exists("error_screenshot.png"):
+          st.image("error_screenshot.png", caption="エラー発生時のブラウザ画面")
+
+  if st.button(
+      "☁️ 取得済みCSVを年別シートに全同期",
+      help=(
+          "サーバー上にある全CSVを年ごとのシートに自動で振り分けて保存します"
+      ),
+  ):
+    with st.spinner("スプレッドシートへ同期中..."):
+      n = save_airregi_csv_to_sheets()
+      if n > 0:
+        st.success(
+            f"🎉 サーバー上の {n} 日分の売上データをスプレッドシートに同期しました！"
+        )
+        st.rerun()
+      else:
+        st.info("同期対象のCSVファイルがありませんでした。")
+
+st.sidebar.markdown("---")
+app_mode = st.sidebar.radio(
+    "機能を選択してください",
+    [
+        "📊 本部用（月報一覧表示）",
+        "📱 店舗用（実績入力）",
+        "📋 エクセルコピペ用データ生成",
+        "📄 報告書作成",
+    ],
+)
+
+selected_store = st.session_state["selected_store"]
+selected_year_month = st.session_state["selected_year_month"]
+year, month = map(int, selected_year_month.split("-"))
+
+# 共通データの取得
+bp_df = load_budget_prev_data()
+deliv_df = load_delivery_data()
+res_df = load_reservations()
+res_sales_df = load_reservation_sales()
+airregi_year_df = get_airregi_sheet_for_year(str(year))
+
+if app_mode == "📱 店舗用（実績入力）":
+  st.markdown(
+      """
+        <style>
+        .stTabs [data-baseweb="tab-list"] { gap: 10px; }
+        .stTabs [data-baseweb="tab"] {
+            background-color: #f8f9fa !important;
+            border: 1px solid #ddd !important;
+            border-radius: 5px !important;
+            padding: 10px 20px !important;
+            margin: 0 !important;
+        }
+        .stTabs [data-baseweb="tab"][aria-selected="true"] {
+            background-color: #ef4444 !important;
+            border-color: #ef4444 !important;
+        }
+        .stTabs [data-baseweb="tab"] * { color: #333 !important; font-weight: bold; }
+        .stTabs [data-baseweb="tab"][aria-selected="true"] * { color: #fff !important; }
+        .stTabs [data-baseweb="tab-highlight"] { display: none; }
+        </style>
+    """,
+      unsafe_allow_html=True,
+  )
+
+  st.title("📱 実績・予約管理")
+  st.markdown(
+      f"現在選択中の店舗: **{selected_store}** （サイドバーで変更可能）"
+  )
+
+  tab_input, tab_manage = st.tabs(
+      ["📝 日次入力 (デリバリー / 予約)", "⚙️ 予約データの確認・修正・削除"]
+  )
+
+  with tab_input:
+    st.markdown(
+        """
+            <div style="background-color: #e3f2fd; padding: 10px 20px; border-radius: 5px; border-left: 5px solid #1976d2; margin-bottom: 15px;">
+                <h3 style="margin: 0; color: #0d47a1;">🎯 入力対象の日付と時間帯</h3>
+            </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    col_t1, col_t2 = st.columns(2)
+    with col_t1:
+      selected_date_val = st.date_input(
+          "対象日付",
+          value=st.session_state["target_date_state"],
+          key="daily_date_input",
+      )
+    with col_t2:
+      selected_slot = st.selectbox(
+          "時間帯を選択", TIME_SLOTS, key="daily_slot"
+      )
+    if selected_date_val != st.session_state["target_date_state"]:
+      st.session_state["target_date_state"] = selected_date_val
+    selected_date = selected_date_val.strftime("%Y-%m-%d")
+    st.markdown("---")
+
+    st.subheader(
+        f"🛵 1. デリバリー売上 【対象: {selected_date} / {selected_slot}】"
+    )
+    just_saved_deliv = False
+    if "msg_deliv" in st.session_state:
+      st.success(st.session_state["msg_deliv"])
+      del st.session_state["msg_deliv"]
+      just_saved_deliv = True
+
+    existing_row = deliv_df[
+        (deliv_df["date"] == selected_date)
+        & (deliv_df["store"] == selected_store)
+        & (deliv_df["time_slot"] == selected_slot)
+    ]
+
+    d_uber, d_rn, d_demae, d_other = 0, 0, 0, 0
+    if not existing_row.empty:
+      d_uber = (
+          parse_int(existing_row["uber"].values[0])
+          if "uber" in existing_row.columns
+          else 0
+      )
+      d_rn = (
+          parse_int(existing_row["rocket_now"].values[0])
+          if "rocket_now" in existing_row.columns
+          else 0
+      )
+      d_demae = (
+          parse_int(existing_row["demaekan"].values[0])
+          if "demaekan" in existing_row.columns
+          else 0
+      )
+      d_other = (
+          parse_int(existing_row["other"].values[0])
+          if "other" in existing_row.columns
+          else 0
+      )
+      if not just_saved_deliv:
+        st.info(
+            f"ℹ️ {selected_date} / {selected_slot}"
+            " のデータは登録済みです。上書き保存されます。"
+        )
+
+    css_input_rules = []
+    if not existing_row.empty:
+      c_uber = "#c0392b" if d_uber < 0 else "#000000"
+      c_rn = "#c0392b" if d_rn < 0 else "#000000"
+      c_demae = "#c0392b" if d_demae < 0 else "#000000"
+      c_other = "#c0392b" if d_other < 0 else "#000000"
+      css_input_rules.append(
+          'input[aria-label="Uber Eats 売上 (円)"] { color:'
+          f" {c_uber} !important; font-weight: bold !important; font-size:"
+          " 16px !important; }"
+      )
+      css_input_rules.append(
+          'input[aria-label="Rocket now 売上 (円)"] { color:'
+          f" {c_rn} !important; font-weight: bold !important; font-size: 16px"
+          " !important; }"
+      )
+      css_input_rules.append(
+          'input[aria-label="出前館 売上 (円)"] { color:'
+          f" {c_demae} !important; font-weight: bold !important; font-size:"
+          " 16px !important; }"
+      )
+      css_input_rules.append(
+          'input[aria-label="その他 売上 (円)"] { color:'
+          f" {c_other} !important; font-weight: bold !important; font-size:"
+          " 16px !important; }"
+      )
+    if css_input_rules:
+      st.markdown(
+          "<style>" + "\n".join(css_input_rules) + "</style>",
+          unsafe_allow_html=True,
+      )
+
+    k_d_uber = f"d_uber_{selected_date}_{selected_slot}_{st.session_state['form_d_key']}"
+    k_d_rn = (
+        f"d_rn_{selected_date}_{selected_slot}_{st.session_state['form_d_key']}"
+    )
+    k_d_dem = f"d_dem_{selected_date}_{selected_slot}_{st.session_state['form_d_key']}"
+    k_d_oth = f"d_oth_{selected_date}_{selected_slot}_{st.session_state['form_d_key']}"
+
+    c1, c2 = st.columns(2)
+    with c1:
+      uber_val = st.number_input(
+          "Uber Eats 売上 (円)", value=d_uber, step=500, key=k_d_uber
+      )
+      rn_val = st.number_input(
+          "Rocket now 売上 (円)", value=d_rn, step=500, key=k_d_rn
+      )
+    with c2:
+      demaekan_val = st.number_input(
+          "出前館 売上 (円)", value=d_demae, step=500, key=k_d_dem
+      )
+      other_val = st.number_input(
+          "その他 売上 (円)", value=d_other, step=500, key=k_d_oth
+      )
+
+    st.markdown("---")
+    total_delivery = uber_val + rn_val + demaekan_val + other_val
+    if total_delivery < 0:
+      st.markdown(
+          f"💡 この時間帯の売上合計: <span style='color: #c0392b; font-weight:"
+          f" bold; font-size: 1.15em;'>¥{total_delivery:,}</span>",
+          unsafe_allow_html=True,
+      )
+    else:
+      st.markdown(f"💡 この時間帯の売上合計: **¥{total_delivery:,}**")
+
+    if st.button("💾 デリバリー売上を保存", type="primary"):
+      save_delivery_data(
+          selected_date,
+          selected_store,
+          selected_slot,
+          uber_val,
+          rn_val,
+          demaekan_val,
+          other_val,
+      )
+      st.session_state["msg_deliv"] = (
+          f"🎉 【{selected_date} /"
+          f" {selected_slot}】のデリバリー売上を保存しました！"
+      )
+      st.session_state["form_d_key"] += 1
+      st.rerun()
+
+    st.markdown("---")
+
+    st.subheader(
+        "📈 2. 予約売上計上（商品引渡）【計上日:"
+        f" {selected_date} / {selected_slot}】"
+    )
+    if "msg_res_sales" in st.session_state:
+      st.success(st.session_state["msg_res_sales"])
+      del st.session_state["msg_res_sales"]
+
+    st.info(
+        "過去に預かった予約金から、本日分の売上を計上します。ここで登録した金額は月報の店頭売上にプラス処理されます。"
+    )
+    store_reservations = res_df[res_df["store"] == selected_store].copy()
+
+    active_reservations = []
+    for _, r in store_reservations.iterrows():
+      t_sales = res_sales_df[res_sales_df["reservation_id"] == r["id"]][
+          "amount"
+      ].sum()
+      if (r["amount"] - t_sales) > 0:
+        active_reservations.append(r)
+    active_store_reservations = pd.DataFrame(active_reservations)
+
+    if active_store_reservations.empty:
+      st.warning(
+          "現在、この店舗に計上可能な予約入金（未完了の予約）はありません。"
+      )
+    else:
+      mng_list = active_store_reservations["management_name"].tolist()
+      k_s_mng = f"s_mng_{selected_date}_{selected_slot}_{st.session_state['form_s_key']}"
+      k_s_amt = f"s_amt_{selected_date}_{selected_slot}_{st.session_state['form_s_key']}"
+
+      selected_mng = st.selectbox("対象の予約を選択", mng_list, key=k_s_mng)
+      sel_res = active_store_reservations[
+          active_store_reservations["management_name"] == selected_mng
+      ].iloc[0]
+
+      total_deposit = sel_res["amount"]
+      total_sales = res_sales_df[
+          res_sales_df["reservation_id"] == sel_res["id"]
+      ]["amount"].sum()
+      balance = total_deposit - total_sales
+
+      st.markdown(
+          f"**預かり金額**: ¥{total_deposit:,} | **計上済**: ¥{total_sales:,} |"
+          f" **残額**: <span style='color:red;"
+          f" font-size:1.2em;'>¥{balance:,}</span>",
+          unsafe_allow_html=True,
+      )
+      s_amount = st.number_input(
+          "本日の計上金額 (円)",
+          min_value=0,
+          max_value=int(balance),
+          step=500,
+          value=0,
+          key=k_s_amt,
+      )
+
+      if st.button("📈 売上を計上する", type="primary"):
+        if s_amount > 0:
+          save_reservation_sale(
+              sel_res["id"],
+              selected_store,
+              selected_date,
+              selected_slot,
+              s_amount,
+          )
+          st.session_state["msg_res_sales"] = (
+              f"🎉 【{selected_date} / {selected_slot}】に「{selected_mng}」の売上"
+              f" (¥{s_amount:,}) を計上しました！"
+          )
+          st.session_state["form_s_key"] += 1
+          st.rerun()
+        else:
+          st.error("計上金額を正しく入力してください。")
+
+    st.markdown("---")
+
+    st.subheader(f"📥 3. 予約入金（事前預かり）【入金日: {selected_date}】")
+    if "msg_res_dep" in st.session_state:
+      st.success(st.session_state["msg_res_dep"])
+      del st.session_state["msg_res_dep"]
+
+    st.info(
+        "Airレジに入金として打たれた予約預かり金を登録します。ここで登録した金額は月報でマイナス処理（相殺）されます。"
+    )
+    k_mng = (
+        f"r_mng_{selected_date}_{selected_slot}_{st.session_state['form_r_key']}"
+    )
+    k_amt = (
+        f"r_amt_{selected_date}_{selected_slot}_{st.session_state['form_r_key']}"
+    )
+    k_cust = (
+        f"r_cust_{selected_date}_{selected_slot}_{st.session_state['form_r_key']}"
+    )
+    k_phone = f"r_phone_{selected_date}_{selected_slot}_{st.session_state['form_r_key']}"
+    k_notes = f"r_notes_{selected_date}_{selected_slot}_{st.session_state['form_r_key']}"
+    k_r_slot = f"r_slot_{selected_date}_{selected_slot}_{st.session_state['form_r_key']}"
+
+    r_slot = st.selectbox(
+        "Airレジ入力時間帯",
+        ["時間帯未指定"] + TIME_SLOTS,
+        index=(
+            TIME_SLOTS.index(selected_slot) + 1
+            if selected_slot in TIME_SLOTS
+            else 0
+        ),
+        key=k_r_slot,
+        help="未指定の場合は月報の「合計」のみで相殺されます",
+    )
+    c3, c4 = st.columns(2)
+    with c3:
+      r_mng_name = st.text_input("管理名 (例: 高山様 10月平日分)", key=k_mng)
+    with c4:
+      r_amount = st.number_input(
+          "預かり金額 (円)", min_value=0, step=1000, value=0, key=k_amt
+      )
+    c5, c6 = st.columns(2)
+    with c5:
+      r_cust_name = st.text_input("顧客名", key=k_cust)
+    with c6:
+      r_phone = st.text_input("電話番号", key=k_phone)
+    r_notes = st.text_area("備考", key=k_notes)
+
+    if st.button("📥 入金を登録する", type="primary"):
+      if r_mng_name and r_amount > 0:
+        save_reservation(
+            selected_store,
+            selected_date,
+            r_slot,
+            r_mng_name,
+            r_amount,
+            r_cust_name,
+            r_phone,
+            r_notes,
+        )
+        st.session_state["msg_res_dep"] = (
+            f"🎉 【{selected_date}】に「{r_mng_name}」の入金 (¥{r_amount:,})"
+            " を登録しました！"
+        )
+        st.session_state["form_r_key"] += 1
+        st.rerun()
+      else:
+        st.error("管理名と預かり金額を入力してください。")
+
+  with tab_manage:
+    if "flash_msg_manage" in st.session_state:
+      st.success(st.session_state["flash_msg_manage"])
+      del st.session_state["flash_msg_manage"]
+
+    manage_mode = st.radio(
+        "操作を選択",
+        ["履歴一覧", "入金データの修正・削除", "売上計上データの修正・削除"],
+        horizontal=True,
+    )
+    store_reservations = res_df[res_df["store"] == selected_store].copy()
+
+    if manage_mode == "履歴一覧":
+      if store_reservations.empty:
+        st.write("データがありません。")
+      else:
+        filter_opt = st.radio(
+            "表示フィルター",
+            ["すべて表示", "未完了（残額あり）のみ"],
+            horizontal=True,
+        )
+
+        events = []
+        for _, r in store_reservations.iterrows():
+          res_id = r["id"]
+          mng_name = r["management_name"]
+
+          events.append({
+              "res_id": res_id,
+              "管理名": mng_name,
+              "実行日": r["date"],
+              "時間帯": (
+                  r["time_slot"] if r["time_slot"] != "時間帯未指定" else ""
+              ),
+              "預かり金額": r["amount"],
+              "計上売上": None,
+              "顧客名": (
+                  r["customer_name"] if pd.notna(r["customer_name"]) else ""
+              ),
+              "電話番号": r["phone"] if pd.notna(r["phone"]) else "",
+              "備考": r["notes"] if pd.notna(r["notes"]) else "",
+              "type": "deposit",
+          })
+
+          sales = res_sales_df[res_sales_df["reservation_id"] == res_id]
+          for _, s in sales.iterrows():
+            events.append({
+                "res_id": res_id,
+                "管理名": mng_name,
+                "実行日": s["date"],
+                "時間帯": s["time_slot"],
+                "預かり金額": None,
+                "計上売上": s["amount"],
+                "顧客名": "",
+                "電話番号": "",
+                "備考": "",
+                "type": "sale",
+            })
+
+        grouped_events = {}
+        for e in events:
+          grouped_events.setdefault(e["res_id"], []).append(e)
+
+        final_rows = []
+        for res_id, evs in grouped_events.items():
+          evs.sort(
+              key=lambda x: (x["実行日"], 0 if x["type"] == "deposit" else 1)
+          )
+          balance = 0
+          for e in evs:
+            if e["type"] == "deposit":
+              balance += e["預かり金額"]
+            else:
+              balance -= e["計上売上"]
+            e["残額"] = balance
+
+          if filter_opt == "未完了（残額あり）のみ" and balance <= 0:
+            continue
+
+          final_rows.extend(evs)
+
+        final_rows.sort(
+            key=lambda x: (x["実行日"], 0 if x["type"] == "deposit" else 1)
+        )
+
+        display_data = []
+        for r in final_rows:
+          d_parts = r["実行日"].replace("-", "/").split("/")
+          d_str = (
+              f"{d_parts[0]}/{int(d_parts[1])}/{int(d_parts[2])}"
+              if len(d_parts) == 3
+              else r["実行日"]
+          )
+
+          display_data.append({
+              "管理名": r["管理名"],
+              "実行日": d_str,
+              "時間帯": r["時間帯"],
+              "預かり金額": (
+                  f"¥{int(r['預かり金額']):,}"
+                  if r["預かり金額"] is not None
+                  else ""
+              ),
+              "計上売上": (
+                  f"¥{int(r['計上売上']):,}"
+                  if r["計上売上"] is not None
+                  else ""
+              ),
+              "残額": f"¥{int(r['残額']):,}",
+              "顧客名": r["顧客名"],
+              "電話番号": r["電話番号"],
+              "備考": r["備考"],
+          })
+
+        if not display_data:
+          st.write("該当するデータがありません。")
+        else:
+          html = (
+              '<div style="max-height: 60vh; overflow-y: auto; overflow-x:'
+              " auto; margin-bottom: 20px;\"><table style=\"width: 100%;"
+              " border-collapse: collapse; font-family: sans-serif; font-size:"
+              ' 14px; text-align: center; white-space: nowrap;"><thead><tr'
+              ' style="text-align: center;">'
+          )
+          for col in [
+              "管理名",
+              "実行日",
+              "時間帯",
+              "預かり金額",
+              "計上売上",
+              "残額",
+              "顧客名",
+              "電話番号",
+              "備考",
+          ]:
+            html += (
+                '<th style="position: sticky; top: 0; background-color:'
+                " #f39c12; color: #ffffff; border: 1px solid #e0e0e0; padding:"
+                f' 8px; font-weight: bold; z-index: 1;">{col}</th>'
+            )
+          html += "</tr></thead><tbody>"
+          for idx, row in enumerate(display_data):
+            bg_color = "#fffbf0" if idx % 2 == 0 else "#ffffff"
+            html += (
+                f'<tr style="background-color: {bg_color}; text-align: center;">'
+            )
+            for col in [
+                "管理名",
+                "実行日",
+                "時間帯",
+                "預かり金額",
+                "計上売上",
+                "残額",
+                "顧客名",
+                "電話番号",
+                "備考",
+            ]:
+              val = str(row[col])
+              style = (
+                  "border: 1px solid #e0e0e0; padding: 8px; white-space:"
+                  " nowrap;"
+              )
+              if col in ["預かり金額", "計上売上", "残額"] and val != "":
+                style += " font-weight: bold;"
+              html += f'<td style="{style}">{val}</td>'
+            html += "</tr>"
+          html += "</tbody></table></div>"
+          st.markdown(html, unsafe_allow_html=True)
+
+    elif manage_mode == "入金データの修正・削除":
+      if store_reservations.empty:
+        st.write("修正できる入金データがありません。")
+      else:
+        edit_res_list = [
+            f"{r['date']} | {r['management_name']} (¥{r['amount']:,})"
+            for _, r in store_reservations.iterrows()
+        ]
+        selected_edit_str = st.selectbox(
+            "修正・削除する予約を選択", edit_res_list
+        )
+        sel_idx = edit_res_list.index(selected_edit_str)
+        sel_res = store_reservations.iloc[sel_idx]
+
+        st.markdown(f"#### 【{sel_res['management_name']}】のデータ編集")
+
+        k_e_date = f"e_date_{sel_res['id']}"
+        k_e_slot = f"e_slot_{sel_res['id']}"
+        k_e_mng = f"e_mng_{sel_res['id']}"
+        k_e_amt = f"e_amt_{sel_res['id']}"
+        k_e_cust = f"e_cust_{sel_res['id']}"
+        k_e_phone = f"e_phone_{sel_res['id']}"
+        k_e_notes = f"e_notes_{sel_res['id']}"
+
+        c1, c2 = st.columns(2)
+        with c1:
+          e_date = st.date_input(
+              "入金日",
+              value=datetime.strptime(sel_res["date"], "%Y-%m-%d").date(),
+              key=k_e_date,
+          ).strftime("%Y-%m-%d")
+        with c2:
+          idx_slot = (
+              (["時間帯未指定"] + TIME_SLOTS).index(sel_res["time_slot"])
+              if sel_res["time_slot"] in ["時間帯未指定"] + TIME_SLOTS
+              else 0
+          )
+          e_slot = st.selectbox(
+              "時間帯",
+              ["時間帯未指定"] + TIME_SLOTS,
+              index=idx_slot,
+              key=k_e_slot,
+          )
+        c3, c4 = st.columns(2)
+        with c3:
+          e_mng = st.text_input(
+              "管理名", value=sel_res["management_name"], key=k_e_mng
+          )
+        with c4:
+          e_amt = st.number_input(
+              "預かり金額 (円)",
+              value=int(sel_res["amount"]),
+              min_value=0,
+              step=1000,
+              key=k_e_amt,
+          )
+        c5, c6 = st.columns(2)
+        with c5:
+          e_cust = st.text_input(
+              "顧客名",
+              value=(
+                  str(sel_res["customer_name"])
+                  if pd.notna(sel_res["customer_name"])
+                  else ""
+              ),
+              key=k_e_cust,
+          )
+        with c6:
+          e_phone = st.text_input(
+              "電話番号",
+              value=(
+                  str(sel_res["phone"]) if pd.notna(sel_res["phone"]) else ""
+              ),
+              key=k_e_phone,
+          )
+        e_notes = st.text_area(
+            "備考",
+            value=str(sel_res["notes"]) if pd.notna(sel_res["notes"]) else "",
+            key=k_e_notes,
+        )
+
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+          if st.button("🔄 この内容で更新する", type="primary"):
+            total_sales = res_sales_df[
+                res_sales_df["reservation_id"] == sel_res["id"]
+            ]["amount"].sum()
+            original_amt = int(sel_res["amount"])
+
+            if original_amt <= total_sales and e_amt != original_amt:
+              st.error(
+                  "完了済みのため、金額の変更はできません。売上計上の修正を先に行ってください。"
+              )
+            elif e_amt < total_sales:
+              st.error(
+                  f"計上済みの売上（¥{total_sales:,}）を下回る金額には変更できません。"
+              )
+            else:
+              update_reservation(
+                  sel_res["id"],
+                  e_date,
+                  e_slot,
+                  e_mng,
+                  e_amt,
+                  e_cust,
+                  e_phone,
+                  e_notes,
+              )
+              st.session_state["flash_msg_manage"] = (
+                  "🔄 予約データを更新しました。"
+              )
+              st.rerun()
+        with col_btn2:
+          if st.button("🗑️ この予約を削除する", type="secondary"):
+            delete_reservation(sel_res["id"])
+            st.session_state["flash_msg_manage"] = (
+                "🗑️ 予約データおよび関連する売上計上データを削除しました。"
+            )
+            st.rerun()
+
+    elif manage_mode == "売上計上データの修正・削除":
+      store_sales = res_sales_df[
+          res_sales_df["store"] == selected_store
+      ].copy()
+      if store_sales.empty:
+        st.write("修正できる売上計上データがありません。")
+      else:
+        sale_options = []
+        for _, s in store_sales.iterrows():
+          parent = res_df[res_df["id"] == s["reservation_id"]]
+          mng = (
+              parent["management_name"].values[0]
+              if not parent.empty
+              else "不明な予約"
+          )
+          sale_options.append(
+              f"{s['date']} | {mng} | {s['time_slot']} (¥{s['amount']:,})"
+          )
+
+        selected_sale_str = st.selectbox(
+            "修正・削除する売上計上データを選択", sale_options
+        )
+        sel_sale_idx = sale_options.index(selected_sale_str)
+        sel_sale = store_sales.iloc[sel_sale_idx]
+
+        st.markdown("#### 売上計上データの編集")
+
+        k_e_s_date = f"e_s_date_{sel_sale['id']}"
+        k_e_s_slot = f"e_s_slot_{sel_sale['id']}"
+        k_e_s_amt = f"e_s_amt_{sel_sale['id']}"
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+          e_s_date = st.date_input(
+              "計上日",
+              value=datetime.strptime(sel_sale["date"], "%Y-%m-%d").date(),
+              key=k_e_s_date,
+          ).strftime("%Y-%m-%d")
+        with c2:
+          e_s_slot = st.selectbox(
+              "計上 時間帯",
+              TIME_SLOTS,
+              index=(
+                  TIME_SLOTS.index(sel_sale["time_slot"])
+                  if sel_sale["time_slot"] in TIME_SLOTS
+                  else 0
+              ),
+              key=k_e_s_slot,
+          )
+        with c3:
+          e_s_amt = st.number_input(
+              "計上金額 (円)",
+              value=int(sel_sale["amount"]),
+              min_value=0,
+              step=500,
+              key=k_e_s_amt,
+          )
+
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+          if st.button("🔄 この計上データを更新する", type="primary"):
+            update_reservation_sale(sel_sale["id"], e_s_date, e_s_slot, e_s_amt)
+            st.session_state["flash_msg_manage"] = (
+                "🔄 売上計上データを更新しました。"
+            )
+            st.rerun()
+        with col_btn2:
+          if st.button("🗑️ この計上データを削除する", type="secondary"):
+            delete_reservation_sale(sel_sale["id"])
+            st.session_state["flash_msg_manage"] = (
+                "🗑️ 売上計上データを削除しました。"
+            )
+            st.rerun()
+
+elif app_mode == "📋 エクセルコピペ用データ生成":
+  st.title("📋 エクセル実績入力用データ生成")
+  st.markdown(f"現在選択中の店舗: **{selected_store}**")
+  target_date_val = st.date_input(
+      "対象日付",
+      value=st.session_state["target_date_state"],
+      key="copy_date_input",
+  )
+  if target_date_val != st.session_state["target_date_state"]:
+    st.session_state["target_date_state"] = target_date_val
+  target_date_str = target_date_val.strftime("%Y-%m-%d")
+
+  raw_df = find_airregi_data_in_memory(target_date_str, airregi_year_df)
+  if raw_df is None:
+    st.warning(f"⚠️ **{target_date_str}** のAirレジデータが見つかりません。")
+
+  def get_slot_metrics(store_name, slot_name, df_data):
+    air_sales, air_cust = 0, 0
+    if df_data is not None:
+      try:
+        short_key = get_short_store_key(store_name)
+        store_df = df_data[
+            df_data[0].astype(str).str.contains(short_key, na=False)
+        ]
+        matched = match_slot_row(store_df, slot_name)
+        if not matched.empty:
+          air_sales = parse_int(matched.iloc[0, 2])
+          air_cust = parse_int(matched.iloc[0, 5])
+      except Exception:
+        pass
+    return air_sales, air_cust
+
+  def get_slot_delivery_total(store_name, date_str, slot_name):
+    sub = deliv_df[
+        (deliv_df["date"].astype(str).str.strip() == date_str.strip())
+        & (deliv_df["store"].astype(str).str.strip() == store_name.strip())
+        & (deliv_df["time_slot"].astype(str).str.strip() == slot_name.strip())
+    ]
+    return (
+        int(
+            pd.to_numeric(sub["uber"], errors="coerce").fillna(0).sum()
+            + pd.to_numeric(sub["rocket_now"], errors="coerce").fillna(0).sum()
+            + pd.to_numeric(sub["demaekan"], errors="coerce").fillna(0).sum()
+        )
+        if not sub.empty
+        else 0
+    )
+
+  early_d = get_slot_delivery_total(selected_store, target_date_str, "早番")
+  mid_d = get_slot_delivery_total(selected_store, target_date_str, "中番")
+  late_d = get_slot_delivery_total(selected_store, target_date_str, "遅番")
+  early_sales, early_cust = get_slot_metrics(selected_store, "早番", raw_df)
+  mid_sales, mid_cust = get_slot_metrics(selected_store, "中番", raw_df)
+  late_sales, late_cust = get_slot_metrics(selected_store, "遅番", raw_df)
+
+  df_month_all = generate_month_df(
+      selected_store,
+      target_date_val.year,
+      target_date_val.month,
+      None,
+      bp_df,
+      deliv_df,
+      res_df,
+      res_sales_df,
+      airregi_year_df,
+  )
+  day_row = df_month_all[df_month_all["日"] == target_date_val.day]
+  target_other_sales = (
+      int(day_row["その他売上"].values[0]) if not day_row.empty else 0
+  )
+
+  parts = [
+      str(early_cust),
+      str(early_sales),
+      str(early_d),
+      str(mid_cust),
+      str(mid_sales),
+      str(mid_d),
+      str(late_cust),
+      str(late_sales),
+      str(late_d),
+      str(target_other_sales),
+  ]
+  tabs_list = [
+      "\t" * 4,
+      "\t" * 1,
+      "\t" * 3,
+      "\t" * 4,
+      "\t" * 1,
+      "\t" * 3,
+      "\t" * 4,
+      "\t" * 1,
+      "\t" * 1,
+  ]
+  tsv_text = "".join([
+      part + tabs_list[i] if i < len(tabs_list) else part
+      for i, part in enumerate(parts)
+  ])
+  st.success(f"🎉 {target_date_str} のデータを自動生成しました！")
+  st.code(tsv_text, language="text")
+
+elif app_mode == "📄 報告書作成":
+  st.title("📄 LINE報告書作成")
+  report_date = st.date_input(
+      "集計基準日",
+      value=st.session_state["target_date_state"],
+      key="report_date_input",
+  )
+  if report_date != st.session_state["target_date_state"]:
+    st.session_state["target_date_state"] = report_date
+
+  if st.button("📝 報告用テキストを生成する", type="primary"):
+    _, max_days = calendar.monthrange(year, month)
+    target_end_day = min(report_date.day, max_days)
+    report_lines = [
+        "お疲れ様です。",
+        f"{report_date.month}月{report_date.day}日時点の中間報告です。",
+        "",
+    ]
+
+    for store_name in STORES:
+      short_label = STORE_CREDENTIALS[store_name]["short_label"]
+      df_rep = generate_month_df(
+          store_name,
+          year,
+          month,
+          None,
+          bp_df,
+          deliv_df,
+          res_df,
+          res_sales_df,
+          airregi_year_df,
+      )
+      df_rep_act = df_rep[df_rep["日"] <= target_end_day]
+
+      total_p = df_rep_act["前年売上"].sum()
+      total_b = df_rep_act["予算売上"].sum()
+      total_act = df_rep_act["実績売上"].sum()
+
+      prev_ratio = f"{(total_act / total_p * 100):.1f}%" if total_p > 0 else "-"
+      budget_ratio = (
+          f"{(total_act / total_b * 100):.1f}%" if total_b > 0 else "-"
+      )
+      diff_budget = total_act - total_b
+      diff_str = (
+          f"+{diff_budget:,}円"
+          if diff_budget > 0
+          else f"▲{abs(diff_budget):,}円"
+          if diff_budget < 0
+          else "0円"
+      )
+
+      report_lines.extend([
+          f"【{short_label}】",
+          f"前年比 : {prev_ratio}",
+          f"予算比 : {budget_ratio}",
+          f"累売上 : {total_act:,}円",
+          f"予乖離 : {diff_str}",
+          "",
+      ])
+
+    st.success("🎉 報告用テキストを生成しました！")
+    st.code("\n".join(report_lines).strip(), language="text")
+
 else:
-    print("データが抽出できませんでした。")
-print("=" * 65)
+  st.title("📊 売上月報一覧")
+  st.subheader(f"🏬 {selected_store} {year}年{month}月度")
+  st.markdown("---")
+
+  def format_currency(val):
+    if pd.isna(val):
+      return "-"
+    try:
+      num = int(val)
+      return (
+          f"-¥{abs(num):,}" if num < 0 else f"¥{num:,}" if num > 0 else "¥0"
+      )
+    except:
+      return str(val)
+
+  # 全体サマリー用
+  df_month_total = generate_month_df(
+      selected_store,
+      year,
+      month,
+      None,
+      bp_df,
+      deliv_df,
+      res_df,
+      res_sales_df,
+      airregi_year_df,
+  )
+  df_achieved = df_month_total[df_month_total["実績売上"] != 0]
+  if df_achieved.empty:
+    max_day, df_achieved = 1, df_month_total.iloc[:1]
+  else:
+    max_day = int(df_achieved["日"].max())
+
+  t_p, t_b, t_act = (
+      df_achieved["前年売上"].sum(),
+      df_achieved["予算売上"].sum(),
+      df_achieved["実績売上"].sum(),
+  )
+  t_air, t_del, t_oth = (
+      df_achieved["店頭売上"].sum(),
+      df_achieved["デリバリー売上"].sum(),
+      df_achieved["その他売上"].sum(),
+  )
+  t_res_dep, t_res_sales = (
+      df_achieved["予約金"].sum(),
+      df_achieved["売上計上"].sum(),
+  )
+  t_pc, t_bc, t_ac = (
+      df_achieved["前年客数"].sum(),
+      df_achieved["予算客数"].sum(),
+      df_achieved["実績客数"].sum(),
+  )
+
+  tot_pprice = int(t_p / t_pc) if t_pc > 0 else 0
+  tot_bprice = int(t_b / t_bc) if t_bc > 0 else 0
+  tot_aprice = int(t_act / t_ac) if t_ac > 0 else 0
+
+  p_ratio_str = f"{(t_act / t_p * 100):.1f}%" if t_p > 0 else "-"
+  b_ratio_str = f"{(t_act / t_b * 100):.1f}%" if t_b > 0 else "-"
+  cust_ratio_str = f"{(t_ac / t_pc * 100):.1f}%" if t_pc > 0 else "-"
+  cust_budget_ratio_str = f"{(t_ac / t_bc * 100):.1f}%" if t_bc > 0 else "-"
+  price_ratio_str = f"{(tot_aprice / tot_pprice * 100):.1f}%" if tot_pprice > 0 else "-"
+  price_budget_ratio_str = (
+      f"{(tot_aprice / tot_bprice * 100):.1f}%" if tot_bprice > 0 else "-"
+  )
+
+  summary_data = [{
+      "日": f"{max_day}日時点",
+      "曜日": "合計",
+      "前年比": p_ratio_str,
+      "予算比": b_ratio_str,
+      "前年売上": format_currency(t_p),
+      "予算売上": format_currency(t_b),
+      "実績売上": format_currency(t_act),
+      "店頭売上": format_currency(t_air),
+      "デリバリー売上": format_currency(t_del),
+      "その他売上": format_currency(t_oth),
+      "予約金": format_currency(t_res_dep),
+      "売上計上": format_currency(t_res_sales),
+      "前年客数": int(t_pc),
+      "予算客数": int(t_bc),
+      "実績客数": int(t_ac),
+      "客数前年比": cust_ratio_str,
+      "客数予算比": cust_budget_ratio_str,
+      "前年単価": format_currency(tot_pprice),
+      "予算単価": format_currency(tot_bprice),
+      "実績単価": format_currency(tot_aprice),
+      "単価前年比": price_ratio_str,
+      "単価予算比": price_budget_ratio_str,
+  }]
+
+  def render_styled_html_table(df, is_summary=False):
+    header_bg, header_color = ("#f39c12", "#ffffff")
+    wrap_style = (
+        "overflow-x: auto; margin-bottom: 20px;"
+        if is_summary
+        else (
+            "max-height: 60vh; overflow-y: auto; overflow-x: auto;"
+            " margin-bottom: 20px;"
+        )
+    )
+    cols = list(df.columns)
+
+    html = (
+        f'<div style="{wrap_style}"><table style="width: 100%;'
+        " border-collapse: collapse; font-family: sans-serif; font-size: 14px;"
+        ' white-space: nowrap;"><thead><tr style="text-align: center;">'
+    )
+    for col in cols:
+      html += (
+          f'<th style="position: sticky; top: 0; background-color: {header_bg};'
+          f" color: {header_color}; border: 1px solid #e0e0e0; padding: 8px;"
+          f' font-weight: bold; z-index: 1;">{col}</th>'
+      )
+    html += "</tr></thead><tbody>"
+
+    for idx, row in enumerate(df.to_dict(orient="records")):
+      bg_color = "#fffbf0" if idx % 2 == 0 else "#ffffff"
+      html += (
+          f'<tr style="background-color: {bg_color}; text-align: center;">'
+      )
+      for col in cols:
+        val = str(row[col])
+        style = (
+            "border: 1px solid #e0e0e0; padding: 8px; white-space: nowrap;"
+        )
+        if (
+            col
+            in [
+                "前年比",
+                "予算比",
+                "客数前年比",
+                "客数予算比",
+                "単価前年比",
+                "単価予算比",
+            ]
+            or "%" in val
+        ):
+          if "%" in val:
+            try:
+              num = float(val.replace("%", "").strip())
+              style += (
+                  " color: #27ae60; font-weight: bold;"
+                  if num >= 100.0
+                  else " color: #c0392b; font-weight: bold;"
+              )
+            except Exception:
+              style += " font-weight: bold;"
+          else:
+            style += " font-weight: bold;"
+        elif "-" in val and any(char.isdigit() for char in val):
+          style += " color: #c0392b; font-weight: bold;"
+        elif (
+            col
+            in [
+                "前年売上",
+                "予算売上",
+                "実績売上",
+                "店頭売上",
+                "デリバリー売上",
+                "その他売上",
+                "予約金",
+                "売上計上",
+                "前年単価",
+                "予算単価",
+                "実績単価",
+            ]
+            or is_summary
+        ):
+          style += " font-weight: bold;"
+        html += f'<td style="{style}">{val}</td>'
+      html += "</tr>"
+    return html + "</tbody></table></div>"
+
+  st.markdown(f"### 【{max_day}日時点 累計サマリー】")
+  st.markdown(
+      render_styled_html_table(pd.DataFrame(summary_data), is_summary=True),
+      unsafe_allow_html=True,
+  )
+
+  st.markdown("---")
+  st.markdown("### 🔍 表示する時間帯を選択してください")
+
+  if "active_slot_tab" not in st.session_state:
+    st.session_state["active_slot_tab"] = "合計"
+  selected_tab = st.radio(
+      "時間帯タブ",
+      ["合計", "早番", "中番", "遅番"],
+      horizontal=True,
+      label_visibility="collapsed",
+  )
+  st.session_state["active_slot_tab"] = selected_tab
+  current_kw = {"合計": None, "早番": "早番", "中番": "中番", "遅番": "遅番"}[
+      selected_tab
+  ]
+
+  df_current_slot = generate_month_df(
+      selected_store,
+      year,
+      month,
+      current_kw,
+      bp_df,
+      deliv_df,
+      res_df,
+      res_sales_df,
+      airregi_year_df,
+  )
+  df_current_slot_formatted = df_current_slot.copy()
+  for col in [
+      "前年売上",
+      "予算売上",
+      "実績売上",
+      "店頭売上",
+      "デリバリー売上",
+      "その他売上",
+      "予約金",
+      "売上計上",
+      "前年単価",
+      "予算単価",
+      "実績単価",
+  ]:
+    df_current_slot_formatted[col] = df_current_slot_formatted[col].apply(
+        format_currency
+    )
+
+  st.markdown("---")
+  col_title, col_btn = st.columns([8, 2])
+  with col_title:
+    st.markdown("### 📅 日別実績一覧")
+  with col_btn:
+    excel_data = create_multi_sheet_excel(
+        selected_store,
+        year,
+        month,
+        bp_df,
+        deliv_df,
+        res_df,
+        res_sales_df,
+        airregi_year_df,
+    )
+    st.markdown("<div style='padding-top: 10px;'></div>", unsafe_allow_html=True)
+    st.download_button(
+        label="📥 Excelダウンロード",
+        data=excel_data,
+        file_name=f"{selected_store}_{year}年{month}月度_売上月報.xlsx",
+        mime=(
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        ),
+        type="primary",
+        use_container_width=True,
+    )
+
+  st.markdown(
+      render_styled_html_table(df_current_slot_formatted),
+      unsafe_allow_html=True,
+  )
