@@ -83,6 +83,13 @@ def parse_int(val):
     return 0
 
 
+def normalize_date_key(val):
+  if pd.isna(val):
+    return ""
+  parsed = pd.to_datetime(val, errors="coerce")
+  return parsed.strftime("%Y-%m-%d") if pd.notna(parsed) else ""
+
+
 def get_short_store_key(store_name):
   for key in ["三田", "恵比寿", "五反田", "中目黒"]:
     if key in store_name:
@@ -510,6 +517,10 @@ def generate_month_df(
     if target_slot_keyword and not bp_sub.empty:
       bp_sub = bp_sub[bp_sub["time_slot"] == target_slot_keyword]
     if not bp_sub.empty:
+      bp_sub = bp_sub.copy()
+      bp_sub["_date_key"] = bp_sub["date"].apply(normalize_date_key)
+      bp_sub = bp_sub[bp_sub["_date_key"] != ""]
+
       b_cust_col = None
       for c in ["budget_cust", "予算客数", "b_cust", "budget_customers"]:
         if c in bp_sub.columns:
@@ -534,11 +545,11 @@ def generate_month_df(
           d_sales_col = c
           break
 
-      for d, grp in bp_sub.groupby("date"):
+      for d, grp in bp_sub.groupby("_date_key"):
         b_cust_val = parse_int(grp[b_cust_col].sum()) if b_cust_col else 0
         s_sales_val = parse_int(grp[s_sales_col].sum()) if s_sales_col else 0
         d_sales_val = parse_int(grp[d_sales_col].sum()) if d_sales_col else 0
-        bp_dict[str(d).strip()] = {
+        bp_dict[d] = {
             "prev_sales": parse_int(grp["prev_sales"].sum()),
             "budget_sales": parse_int(grp["budget_sales"].sum()),
             "prev_cust": parse_int(grp["prev_cust"].sum()),
