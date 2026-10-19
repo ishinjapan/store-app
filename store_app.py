@@ -103,13 +103,29 @@ def match_slot_row(store_df, slot_name):
 
 
 # --- キャッシュ付きデータロード関数群 ---
+def deduplicate_budget_prev_data(df):
+  if df.empty:
+    return df
+
+  df = df.copy()
+  df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
+  date_keys = df["date"].apply(normalize_date_key)
+  valid_date = date_keys != ""
+  duplicate_indices = df.loc[valid_date].index[
+      pd.DataFrame({
+          "date": date_keys.loc[valid_date],
+          "store": df.loc[valid_date, "store"].astype(str).str.strip(),
+          "time_slot": df.loc[valid_date, "time_slot"],
+      }).duplicated(keep="first")
+  ]
+  return df.drop(index=duplicate_indices)
+
+
 @st.cache_data(ttl=60)
 def load_budget_prev_data():
   try:
     df = conn.read(worksheet="budget_prev", ttl=0).dropna(how="all")
-    if not df.empty:
-      df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
-    return df
+    return deduplicate_budget_prev_data(df)
   except Exception:
     return pd.DataFrame(
         columns=[
