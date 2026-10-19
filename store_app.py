@@ -8,6 +8,7 @@ import subprocess
 import sys
 import uuid
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 import pandas as pd
 import streamlit as st
 from streamlit_gsheets import GSheetsConnection
@@ -125,6 +126,103 @@ def deduplicate_budget_prev_data(df):
       }).duplicated(keep="first")
   ]
   return df.drop(index=duplicate_indices)
+
+
+def prepare_actual_customer_csv(uploaded_file):
+  df = pd.read_csv(uploaded_file)
+  required_columns = ["date", "store", "time_slot", "actual_cust"]
+  missing_columns = [column for column in required_columns if column not in df.columns]
+  if missing_columns:
+    raise ValueError(
+        "CSVに必要な列がありません: " + ", ".join(missing_columns)
+    )
+
+  df = df[required_columns].copy()
+  df["date"] = df["date"].apply(normalize_date_key)
+  df["store"] = df["store"].astype(str).str.strip()
+  df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
+  if (df["date"] == "").any():
+    raise ValueError("日付を読み取れない行があります。")
+  if not df["store"].isin(STORES).all():
+    raise ValueError("登録されていない店舗名がCSVに含まれています。")
+  if not df["time_slot"].isin(TIME_SLOTS).all():
+    raise ValueError("時間帯は早番・中番・遅番のいずれかを指定してください。")
+
+  numeric_counts = pd.to_numeric(df["actual_cust"], errors="coerce")
+  invalid_counts = df["actual_cust"].notna() & numeric_counts.isna()
+  if invalid_counts.any():
+    raise ValueError("実績客数に数値以外の値が含まれています。")
+  if (numeric_counts.dropna() < 0).any():
+    raise ValueError("実績客数に負数は指定できません。")
+  if ((numeric_counts.dropna() % 1) != 0).any():
+    raise ValueError("実績客数は整数で指定してください。")
+
+  df["actual_cust"] = numeric_counts.astype("Int64")
+  key_columns = ["date", "store", "time_slot"]
+  if df.duplicated(key_columns).any():
+    raise ValueError("日付・店舗・時間帯が重複する行があります。")
+  return df
+
+
+def update_actual_customer_column(uploaded_file):
+  csv_df = prepare_actual_customer_csv(uploaded_file)
+  sheet_df = conn.read(worksheet="budget_prev", ttl=0).dropna(how="all")
+  key_columns = ["date", "store", "time_slot"]
+  missing_columns = [column for column in key_columns if column not in sheet_df]
+  if missing_columns:
+    raise ValueError(
+        "budget_prevシートに必要な列がありません: "
+        + ", ".join(missing_columns)
+    )
+
+  sheet_df = sheet_df.copy()
+  sheet_df["_date_key"] = sheet_df["date"].apply(normalize_date_key)
+  sheet_df["_store_key"] = sheet_df["store"].astype(str).str.strip()
+  sheet_df["_slot_key"] = sheet_df["time_slot"].apply(normalize_time_slot)
+  sheet_key_columns = ["_date_key", "_store_key", "_slot_key"]
+  sheet_keys = sheet_df[sheet_key_columns].rename(
+      columns=dict(zip(sheet_key_columns, key_columns))
+  )
+  if sheet_keys.duplicated(key_columns).any():
+    raise ValueError(
+        "budget_prevシートに日付・店舗・時間帯の重複があります。"
+        "データを変更せず中止しました。"
+    )
+
+  csv_keys = set(map(tuple, csv_df[key_columns].itertuples(index=False, name=None)))
+  sheet_key_set = set(map(tuple, sheet_keys.itertuples(index=False, name=None)))
+  if csv_keys != sheet_key_set:
+    missing_in_csv = len(sheet_key_set - csv_keys)
+    missing_in_sheet = len(csv_keys - sheet_key_set)
+    raise ValueError(
+        "CSVとbudget_prevシートの行が一致しないため、"
+        "データを変更せず中止しました。"
+        f"（CSVにないシート行: {missing_in_csv}、シートにないCSV行: {missing_in_sheet}）"
+    )
+
+  counts_by_key = csv_df.set_index(key_columns)["actual_cust"]
+  csv_index = pd.MultiIndex.from_frame(sheet_keys[key_columns])
+  actual_counts = counts_by_key.reindex(csv_index)
+  sheet_df = sheet_df.drop(columns=sheet_key_columns)
+  if "actual_cust" in sheet_df.columns:
+    customer_column = sheet_df.columns.get_loc("actual_cust") + 1
+  else:
+    customer_column = len(sheet_df.columns) + 1
+  column_letter = get_column_letter(customer_column)
+  last_row = len(sheet_df) + 1
+  values = [["actual_cust"]] + [
+      ["" if pd.isna(value) else int(value)] for value in actual_counts
+  ]
+
+  # conn.updateはシート全体を書き換えるため、客数列だけを範囲更新する。
+  worksheet = conn.client._select_worksheet(worksheet="budget_prev")
+  worksheet.update(
+      f"{column_letter}1:{column_letter}{last_row}",
+      values,
+      value_input_option="USER_ENTERED",
+  )
+  load_budget_prev_data.clear()
+  return len(csv_df), int(csv_df["actual_cust"].isna().sum())
 
 
 @st.cache_data(ttl=60)
@@ -559,6 +657,8 @@ def generate_month_df(
           b_cust_col = c
           break
 
+      actual_cust_col = "actual_cust" if "actual_cust" in bp_sub.columns else None
+
       s_sales_col = None
       for c in [
           "store_sales",
@@ -581,11 +681,22 @@ def generate_month_df(
         b_cust_val = parse_int(grp[b_cust_col].sum()) if b_cust_col else 0
         s_sales_val = parse_int(grp[s_sales_col].sum()) if s_sales_col else 0
         d_sales_val = parse_int(grp[d_sales_col].sum()) if d_sales_col else 0
+        actual_cust_values = (
+            pd.to_numeric(grp[actual_cust_col], errors="coerce").dropna()
+            if actual_cust_col
+            else pd.Series(dtype="float64")
+        )
+        actual_cust_val = (
+            int(actual_cust_values.sum())
+            if actual_cust_col and len(actual_cust_values) == len(grp)
+            else None
+        )
         bp_dict[d] = {
             "prev_sales": parse_int(grp["prev_sales"].sum()),
             "budget_sales": parse_int(grp["budget_sales"].sum()),
             "prev_cust": parse_int(grp["prev_cust"].sum()),
             "budget_cust": b_cust_val,
+            "actual_cust": actual_cust_val,
             "store_sales": s_sales_val,
             "delivery_sales": d_sales_val,
         }
@@ -749,7 +860,9 @@ def generate_month_df(
       total_other_sales = air_other_sales + deliv_item.get("other", 0)
 
     actual_sales = adjusted_air_sales + day_delivery_sales + total_other_sales
-    actual_cust = air_cust + estimate_delivery_count(day_delivery_sales)
+    actual_cust = bp_item.get("actual_cust")
+    if actual_cust is None:
+      actual_cust = air_cust + estimate_delivery_count(day_delivery_sales)
 
     # 売上比率
     prev_ratio = (
@@ -1451,8 +1564,32 @@ with st.sidebar.expander("📥 売上データを取得する"):
               f"取得済みCSVはローカルに残っています: {e}"
           )
 
+  st.markdown("#### 実績客数をCSVから反映")
+  customer_csv = st.file_uploader(
+        "実績客数CSV（date, store, time_slot, actual_cust）",
+        type=["csv"],
+        key="actual_customer_csv_upload",
+        help=(
+            "日付・店舗・時間帯がbudget_prevシートの全行と一致するCSVのみ反映します。"
+            "売上や予算など他の列は変更しません。"
+        ),
+  )
+  if customer_csv and st.button(
+        "実績客数だけをスプレッドシートへ反映",
+        key="update_actual_customer_csv_button",
+  ):
+    try:
+        updated_count, blank_count = update_actual_customer_column(customer_csv)
+        st.success(
+            f"実績客数を {updated_count - blank_count} 行反映しました。"
+            f"客数が空欄の {blank_count} 行は空欄のままです。"
+        )
+        st.rerun()
+    except Exception as e:
+        st.error(f"実績客数CSVを反映できませんでした: {e}")
+
   if st.button(
-      "☁️ 取得済みCSVを年別シートに全同期",
+        "☁️ 取得済みCSVを年別シートに全同期",
       help=(
           "サーバー上にある全CSVを年ごとのシートに自動で振り分けて保存します"
       ),
