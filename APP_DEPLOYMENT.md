@@ -1,0 +1,24 @@
+# 本部用・店舗用アプリのデプロイ
+
+同じリポジトリから、Streamlit Community Cloud上に2つのアプリを作成します。
+
+| アプリ | Main file path | 表示内容 |
+| --- | --- | --- |
+| 本部用 | `Honbu_app.py` | 店舗・年月を選択する月報一覧 |
+| 店舗用 | `store_input_app.py` | 店舗を選択する実績・予約入力と予約管理 |
+
+## 設定手順
+
+1. Streamlit Community Cloudでこのリポジトリ・ブランチを選択し、本部用アプリを作成します。Main file pathは `Honbu_app.py` にします。
+2. 同じリポジトリ・ブランチからもう1つアプリを作成し、Main file pathを `store_input_app.py` にします。
+3. 両アプリのSecretsに、既存のGoogle Sheets接続設定をそれぞれ設定します。本部用にはAirレジデータを読むための `AIRREGI_SPREADSHEET` の設定も必要です。
+4. それぞれのアプリで共有先・アクセス権を設定し、本部スタッフと店舗スタッフに該当URLを案内します。
+
+2つのアプリは同じGoogleスプレッドシートを参照するため、月報と店舗入力データは共有されます。店舗用アプリでは入力店舗を選択できます。特定店舗だけに入力先を制限する設定やログイン認証は、このアプリ内では行いません。必要な場合は、デプロイ先のアクセス制御を設定してください。
+
+ローカルでは、リポジトリのルートで次のように起動できます。
+
+```powershell
+streamlit run Honbu_app.py
+streamlit run store_input_app.py
+```

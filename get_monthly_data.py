@@ -250,6 +250,8 @@ def main():
 
     start_dt = datetime.strptime(start_date_str, "%Y-%m-%d")
     end_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
+    if start_dt > end_dt:
+        raise ValueError("開始日は終了日以前の日付を指定してください。")
 
     date_list = []
     curr = start_dt
