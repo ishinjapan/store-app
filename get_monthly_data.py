@@ -196,8 +196,8 @@ def select_store(page, store_name, is_first_store=False):
 
 def navigate_to_sales_page(page):
     close_all_popups(page)
-    current_page_heading = page.locator("h1.title").filter(has_text="日別売上").first
-    if current_page_heading.is_visible():
+    daily_sales_heading = page.locator("h1.title").filter(has_text="日別売上")
+    if daily_sales_heading.count() and daily_sales_heading.first.is_visible():
         return
 
     sales_menu = page.get_by_text("売上・分析", exact=True).first
@@ -209,9 +209,7 @@ def navigate_to_sales_page(page):
     daily_sales_menu = page.locator("text='日別売上'").first
     daily_sales_menu.wait_for(state="visible", timeout=15000)
     daily_sales_menu.click()
-    page.locator("h1.title").filter(has_text="日別売上").wait_for(
-        state="visible", timeout=15000
-    )
+    daily_sales_heading.first.wait_for(state="visible", timeout=15000)
     close_all_popups(page)
 
 def extract_sales_for_date(page, target_date):
