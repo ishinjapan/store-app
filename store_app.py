@@ -170,6 +170,7 @@ def deduplicate_budget_prev_data(df):
   df = df.copy()
   df["time_slot"] = df["time_slot"].apply(normalize_time_slot)
   date_keys = df["date"].apply(normalize_date_key)
+  df["_normalized_date"] = date_keys
   valid_date = date_keys != ""
   duplicate_indices = df.loc[valid_date].index[
       pd.DataFrame({
@@ -808,7 +809,11 @@ def _build_month_df(
     bp_sub = bp_df[bp_df["store"] == selected_store]
     if not bp_sub.empty:
       bp_sub = bp_sub.copy()
-      bp_sub["_date_key"] = bp_sub["date"].apply(normalize_date_key)
+      bp_sub["_date_key"] = (
+          bp_sub["_normalized_date"]
+          if "_normalized_date" in bp_sub.columns
+          else bp_sub["date"].apply(normalize_date_key)
+      )
       bp_sub = bp_sub[bp_sub["_date_key"].str.startswith(
           f"{year:04d}-{month:02d}"
       )]
@@ -1961,9 +1966,9 @@ if APP_VARIANT in {"admin", "combined"}:
   elif {"date", "store"}.issubset(bp_df.columns):
     matching_budget_rows = bp_df[
         (bp_df["store"].astype(str).str.strip() == selected_store)
-        & bp_df["date"]
-        .apply(normalize_date_key)
-        .str.startswith(f"{year:04d}-{month:02d}")
+        & bp_df["_normalized_date"].str.startswith(
+            f"{year:04d}-{month:02d}"
+        )
     ]
     if matching_budget_rows.empty:
       st.warning(
