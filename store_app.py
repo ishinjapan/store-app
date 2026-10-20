@@ -1681,6 +1681,137 @@ else:
   selected_year_month = datetime.now().strftime("%Y-%m")
 
 if APP_VARIANT == "combined":
+  with st.sidebar.expander("📥 売上データを取得する"):
+    target_date = st.date_input(
+        "取得日",
+        value=datetime.now().date(),
+        key="fetch_date_input_sidebar",
+    )
+    if st.button("🚀 取得実行", type="primary", key="fetch_single_date"):
+      target_str = target_date.strftime("%Y-%m-%d")
+      with st.spinner(f"{target_str} 取得中... (完了までお待ちください)"):
+        try:
+          run_airregi_extraction(target_str, target_str)
+          count = save_airregi_csv_to_sheets(target_str)
+          st.success(
+              f"🎉 {target_str} のデータを取得し、"
+              f"スプレッドシートへ {count} 日分を保存しました！"
+          )
+          st.rerun()
+        except subprocess.CalledProcessError as error:
+          show_airregi_extraction_error(error)
+        except Exception as error:
+          st.error(
+              "データの取得またはスプレッドシートへの保存に失敗しました: "
+              f"{error}"
+          )
+
+    st.markdown("#### 期間を指定して取得")
+    date_col_start, date_col_end = st.columns(2)
+    with date_col_start:
+      start_date = st.date_input(
+          "開始日",
+          value=datetime(2025, 10, 1).date(),
+          key="fetch_start_date_sidebar",
+      )
+    with date_col_end:
+      end_date = st.date_input(
+          "終了日",
+          value=datetime(2026, 9, 30).date(),
+          key="fetch_end_date_sidebar",
+      )
+    st.caption(
+        "期間取得は時間がかかります。処理中は画面を閉じずにお待ちください。"
+    )
+    if st.button("📅 期間取得を実行", key="fetch_date_range_button"):
+      if start_date > end_date:
+        st.error("開始日は終了日以前の日付を指定してください。")
+      else:
+        start_str = start_date.strftime("%Y-%m-%d")
+        end_str = end_date.strftime("%Y-%m-%d")
+        date_count = (end_date - start_date).days + 1
+        with st.spinner(
+            f"{start_str} 〜 {end_str} の {date_count} 日分を取得中です。"
+            "完了まで画面を閉じずにお待ちください..."
+        ):
+          try:
+            run_airregi_extraction(start_str, end_str)
+            count = save_airregi_csv_to_sheets(
+                start_date_str=start_str,
+                end_date_str=end_str,
+            )
+            st.success(
+                "🎉 期間取得とスプレッドシートへの保存が完了しました。"
+                f"（対象 {date_count} 日、保存 {count} 日）"
+            )
+            st.rerun()
+          except subprocess.CalledProcessError as error:
+            st.error(
+                f"⚠️ 期間取得に失敗しました。取得済みCSVは"
+                f" {start_str} 〜 {end_str} で同期します。"
+            )
+            try:
+              count = save_airregi_csv_to_sheets(
+                  start_date_str=start_str,
+                  end_date_str=end_str,
+              )
+              st.info(f"失敗前に取得できた {count} 日分を同期しました。")
+            except Exception as sync_error:
+              st.error(f"取得済みCSVの同期にも失敗しました: {sync_error}")
+            show_airregi_extraction_error(error)
+          except Exception as error:
+            st.error(
+                "期間データのスプレッドシートへの保存に失敗しました。"
+                f"取得済みCSVはローカルに残っています: {error}"
+            )
+
+    st.markdown("#### 店頭客数CSVを反映")
+    customer_csv = st.file_uploader(
+        "店頭客数CSV（date, store, time_slot, actual_cust）",
+        type=["csv"],
+        key="actual_customer_csv_upload",
+        help=(
+            "日付・店舗・時間帯がbudget_prevシートの全行と一致するCSVのみ反映します。"
+            "売上や予算など他の列は変更しません。"
+        ),
+    )
+    if customer_csv and st.button(
+        "店頭客数・D件数・D単価をスプレッドシートへ反映",
+        key="update_actual_customer_csv_button",
+    ):
+      try:
+        updated_count, blank_count, estimated_d_count = (
+            update_actual_customer_column(customer_csv)
+        )
+        st.success(
+            f"店頭客数を {updated_count - blank_count} 行反映しました。"
+            f"空欄 {blank_count} 行は空欄のまま、"
+            f"D件数 {estimated_d_count:,} 件を反映しました。"
+        )
+        st.rerun()
+      except Exception as error:
+        st.error(f"店頭客数CSVを反映できませんでした: {error}")
+
+    if st.button(
+        "☁️ 取得済みCSVを年別シートに全同期",
+        key="sync_all_airregi_csv",
+        help="サーバー上にある全CSVを年ごとのシートに自動で振り分けて保存します。",
+    ):
+      with st.spinner("スプレッドシートへ同期中..."):
+        try:
+          count = save_airregi_csv_to_sheets()
+          if count > 0:
+            st.success(
+                f"🎉 サーバー上の {count} 日分の売上データを"
+                "スプレッドシートに同期しました！"
+            )
+            st.rerun()
+          else:
+            st.info("同期対象のCSVファイルがありませんでした。")
+        except Exception as error:
+          st.error(f"スプレッドシートへの同期に失敗しました: {error}")
+
+if APP_VARIANT == "combined":
   app_mode = st.sidebar.radio(
       "機能を選択してください",
       [
