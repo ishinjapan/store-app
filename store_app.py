@@ -1930,6 +1930,7 @@ selected_store = st.session_state["selected_store"]
 year, month = map(int, selected_year_month.split("-"))
 
 # 共通データの取得
+monthly_data_setup_started_at = time.perf_counter()
 try:
   bp_df = timed_call("予算・前年データ読み込み", load_budget_prev_data)
 except RuntimeError as error:
@@ -1978,6 +1979,7 @@ airregi_year_df = (
     if APP_VARIANT in {"admin", "combined"}
     else pd.DataFrame()
 )
+log_performance_time("月報データ準備（読み込み・検証を含む）", monthly_data_setup_started_at)
 
 if app_mode == "📱 店舗用（実績入力）":
   st.markdown(
@@ -2864,6 +2866,7 @@ else:
       res_sales_df,
       airregi_year_df,
   )
+  summary_calculation_started_at = time.perf_counter()
   df_achieved = df_month_total[df_month_total["実績売上"] != 0]
   if df_achieved.empty:
     max_day, df_achieved = 1, df_month_total.iloc[:1]
@@ -2937,6 +2940,7 @@ else:
       "単価前年比": price_ratio_str,
       "単価予算比": price_budget_ratio_str,
   }]
+  log_performance_time("月報サマリー集計", summary_calculation_started_at)
 
   def render_styled_html_table(df, is_summary=False):
     header_bg, header_color = ("#f39c12", "#ffffff")
@@ -3060,6 +3064,7 @@ else:
       res_sales_df,
       airregi_year_df,
   )
+  formatting_started_at = time.perf_counter()
   df_current_slot_formatted = df_current_slot.copy()
   for col in [
       "前年売上",
@@ -3078,6 +3083,7 @@ else:
     df_current_slot_formatted[col] = df_current_slot_formatted[col].apply(
         format_currency
     )
+  log_performance_time("明細データ整形", formatting_started_at)
 
   st.markdown("---")
   col_title, col_btn = st.columns([8, 2])
