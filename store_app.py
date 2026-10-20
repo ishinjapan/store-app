@@ -300,7 +300,7 @@ def load_budget_prev_data():
     ) from error
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=60)
 def load_delivery_data():
   try:
     df = conn.read(worksheet="delivery_sales", ttl=0).dropna(how="all")
@@ -338,7 +338,7 @@ def load_delivery_data():
     )
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=60)
 def load_reservations():
   try:
     df = conn.read(worksheet="reservations", ttl=0).dropna(how="all")
@@ -380,7 +380,7 @@ def load_reservations():
     )
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=60)
 def load_reservation_sales():
   try:
     df = conn.read(worksheet="reservation_sales", ttl=0).dropna(how="all")
@@ -400,7 +400,7 @@ def load_reservation_sales():
     )
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=60)
 def get_airregi_sheet_for_year(year_str):
   if not AIRREGI_SPREADSHEET_URL:
     return pd.DataFrame()
@@ -1668,6 +1668,17 @@ if APP_VARIANT in {"admin", "combined"}:
   ] or [f"{display_year}-10", f"{display_year}-01"]
   st.sidebar.selectbox("対象月", months_in_year, key="selected_year_month")
   selected_year_month = st.session_state["selected_year_month"]
+  if st.sidebar.button(
+      "🔄 最新データを再読み込み",
+      key="refresh_monthly_report_data",
+      help="店舗アプリで登録したデータを含め、スプレッドシートから最新情報を読み込みます。",
+  ):
+    load_budget_prev_data.clear()
+    load_delivery_data.clear()
+    load_reservations.clear()
+    load_reservation_sales.clear()
+    get_airregi_sheet_for_year.clear()
+    st.rerun()
 else:
   selected_year_month = datetime.now().strftime("%Y-%m")
 
