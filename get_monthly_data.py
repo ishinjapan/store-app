@@ -23,72 +23,97 @@ TARGET_STORES = [
 ]
 
 def close_all_popups(page):
-    """AirMATEや各種お知らせポップアップを安全に閉じる・強制消去する"""
-    page.wait_for_timeout(500)
+    """AirMATEや各種お知らせポップアップを閉じる。"""
+    overlay_selector = "div[class*='overlay__Overlay']"
 
-    # 1. AirMATEやモーダルダイアログ内の「✕」「閉じる」ボタンをクリック
-    close_selectors = [
+    def has_visible_overlay():
+        return page.locator(overlay_selector).evaluate_all("""elements =>
+            elements.some(element => {
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.display !== 'none' && style.visibility !== 'hidden';
+            })
+        """)
+
+    dismiss_selectors = [
         "button[aria-label='閉じる']",
         "button[aria-label='close' i]",
-        "button:has-text('✕')",
-        "button:has-text('×')",
+        "button[title='閉じる']",
         "button:has-text('閉じる')",
         "a:has-text('閉じる')",
-        "[role='dialog'] button",
-        "div[class*='modal' i] button",
-        "div[class*='Modal' i] button",
-        "div[class*='dialog' i] button",
-        "button[class*='close' i]",
-        "[class*='Close' i]"
     ]
-    for sel in close_selectors:
+
+    for _ in range(4):
         try:
-            btn = page.locator(sel).first
-            if btn.is_visible(timeout=400):
-                btn.click(timeout=1000)
-                page.wait_for_timeout(800)
-                print("・AirMATE / お知らせポップアップを閉じました。")
-                return
-        except Exception:
-            pass
-
-    # 2. Escapeキーを送信してモーダルを閉じる
-    try:
-        page.keyboard.press("Escape")
-        page.wait_for_timeout(400)
-    except Exception:
-        pass
-
-    # 3. それでも残っている場合、JSでモーダルとオーバーレイ（黒い背景幕）を安全に強制消去
-    try:
-        removed = page.evaluate("""() => {
-            let found = false;
-            const selectors = [
-                '[role="dialog"]',
-                '[class*="modal" i]',
-                '[class*="dialog" i]',
-                '[class*="overlay" i]'
-            ];
-            for (const s of selectors) {
-                document.querySelectorAll(s).forEach(el => {
-                    // 店舗選択画面など業務に必要な画面は消さない
-                    if (el.innerText && (el.innerText.includes('利用する店舗を選択') || el.innerText.includes('店舗を選択'))) {
-                        return;
-                    }
-                    const rect = el.getBoundingClientRect();
-                    if (rect.width > 150 && rect.height > 150) {
-                        el.remove();
-                        found = true;
-                    }
-                });
-            }
-            return found;
-        }""")
-        if removed:
-            print("・ポップアップ要素を強制消去しました。")
             page.wait_for_timeout(500)
-    except Exception:
-        pass
+            clicked = False
+            for selector in dismiss_selectors:
+                buttons = page.locator(selector)
+                for index in range(buttons.count()):
+                    button = buttons.nth(index)
+                    if button.is_visible():
+                        button.click(timeout=1500)
+                        page.wait_for_timeout(500)
+                        clicked = True
+                        break
+                if clicked:
+                    break
+
+            page.keyboard.press("Escape")
+            page.wait_for_timeout(500)
+            if not has_visible_overlay():
+                return
+
+            # AirMATEの閉じるボタンがラベルのないアイコンの場合に備える。
+            dismissed = page.evaluate("""() => {
+                const visible = el => {
+                    const r = el.getBoundingClientRect();
+                    const s = getComputedStyle(el);
+                    return r.width > 0 && r.height > 0 &&
+                        s.display !== 'none' && s.visibility !== 'hidden';
+                };
+                const overlays = [...document.querySelectorAll(
+                    'div[class*="overlay__Overlay"]'
+                )].filter(visible);
+                if (!overlays.length) return true;
+
+                for (const overlay of overlays) {
+                    const root = overlay.closest('[class*="gateway-local"]');
+                    if (!root) continue;
+                    const closeButton = [...root.querySelectorAll('button')]
+                        .filter(visible)
+                        .find(button => {
+                            const r = button.getBoundingClientRect();
+                            const label = [
+                                button.innerText,
+                                button.getAttribute('aria-label'),
+                                button.getAttribute('title')
+                            ].filter(Boolean).join(' ');
+                            return /閉じる|close|×|✕/i.test(label) ||
+                                (r.width < 80 && r.height < 80 &&
+                                 button.querySelector('svg'));
+                        });
+                    if (closeButton) {
+                        closeButton.click();
+                        return true;
+                    }
+                }
+                return false;
+            }""")
+            if dismissed:
+                page.wait_for_timeout(700)
+                if not has_visible_overlay():
+                    print("・AirMATE / お知らせポップアップを閉じました。")
+                    return
+        except Exception as error:
+            print(f"・ポップアップを閉じる処理を再試行します: {error}")
+
+    if has_visible_overlay():
+        raise RuntimeError(
+            "AirMATEなどのポップアップが残っていて画面を操作できません。"
+            "エラー画面のポップアップを閉じてから、もう一度実行してください。"
+        )
 
 def auto_login(page):
     if not AIRREGI_ID or not AIRREGI_PASS:
@@ -171,14 +196,23 @@ def select_store(page, store_name, is_first_store=False):
 
 def navigate_to_sales_page(page):
     close_all_popups(page)
-    sales_menu = page.locator("text='売上・分析'").first
-    page.wait_for_selector("text='売上・分析'", timeout=15000)
-    if not page.locator("text='日別売上'").first.is_visible():
-        sales_menu.click()
-        page.wait_for_timeout(1500)
-    page.wait_for_selector("text='日別売上'", timeout=15000)
-    page.locator("text='日別売上'").first.click()
-    page.wait_for_timeout(2500)
+    current_page_heading = page.locator("h1.title").filter(has_text="日別売上").first
+    if current_page_heading.is_visible():
+        return
+
+    sales_menu = page.get_by_text("売上・分析", exact=True).first
+    sales_menu.wait_for(state="visible", timeout=15000)
+    sales_menu.click()
+    page.wait_for_timeout(1000)
+    close_all_popups(page)
+
+    daily_sales_link = page.locator(
+        "a, button, [role='menuitem']"
+    ).filter(has_text="日別売上").first
+    daily_sales_link.wait_for(state="visible", timeout=15000)
+    daily_sales_link.click()
+    page.wait_for_load_state("domcontentloaded")
+    page.wait_for_timeout(1000)
     close_all_popups(page)
 
 def extract_sales_for_date(page, target_date):
@@ -294,14 +328,7 @@ def main():
                     is_first = (index == 0)
                     select_store(page, store_name, is_first_store=is_first)
 
-                    if index == 0 and target_date == date_list[0]:
-                        navigate_to_sales_page(page)
-                    else:
-                        try:
-                            page.locator("text='日別売上'").first.click()
-                            page.wait_for_timeout(1500)
-                        except Exception:
-                            navigate_to_sales_page(page)
+                    navigate_to_sales_page(page)
 
                     store_rows = extract_sales_for_date(page, target_date)
                     for r in store_rows:
