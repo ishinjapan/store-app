@@ -37,6 +37,7 @@ st.set_page_config(
     layout="wide",
 )
 st.session_state["performance_timings"] = []
+st.session_state.setdefault("monthly_report_cache", {})
 APP_RUN_STARTED_AT = time.perf_counter()
 
 # スプレッドシートとの接続
@@ -120,6 +121,10 @@ def log_performance_time(label, started_at):
       "処理": label,
       "時間（秒）": round(elapsed_ms / 1000, 3),
   })
+
+
+def clear_monthly_report_cache():
+  st.session_state["monthly_report_cache"] = {}
 
 
 def timed_call(label, function, *args):
@@ -301,6 +306,7 @@ def update_actual_customer_column(uploaded_file):
       value_input_option="USER_ENTERED",
   )
   load_budget_prev_data.clear()
+  clear_monthly_report_cache()
   return (
       len(csv_df),
       int(csv_df["actual_cust"].isna().sum()),
@@ -528,6 +534,7 @@ def save_airregi_csv_to_sheets(
       total_synced_dates += len(year_new_df["date"].unique())
 
     st.cache_data.clear()
+    clear_monthly_report_cache()
     return total_synced_dates
   except Exception as e:
     raise RuntimeError(
@@ -643,6 +650,7 @@ def save_delivery_data(
   df = pd.concat([df, new_row], ignore_index=True)
   conn.update(worksheet="delivery_sales", data=df)
   load_delivery_data.clear()
+  clear_monthly_report_cache()
 
 
 def save_reservation(
@@ -664,6 +672,7 @@ def save_reservation(
   df = pd.concat([df, new_row], ignore_index=True)
   conn.update(worksheet="reservations", data=df)
   load_reservations.clear()
+  clear_monthly_report_cache()
 
 
 def update_reservation(
@@ -681,6 +690,7 @@ def update_reservation(
     df.at[idx[0], "notes"] = str(notes) if notes else ""
     conn.update(worksheet="reservations", data=df)
     load_reservations.clear()
+    clear_monthly_report_cache()
 
 
 def delete_reservation(res_id):
@@ -688,12 +698,14 @@ def delete_reservation(res_id):
   df = df[df["id"] != res_id]
   conn.update(worksheet="reservations", data=df)
   load_reservations.clear()
+  clear_monthly_report_cache()
 
   sales_df = load_reservation_sales()
   if not sales_df.empty:
     sales_df = sales_df[sales_df["reservation_id"] != res_id]
     conn.update(worksheet="reservation_sales", data=sales_df)
     load_reservation_sales.clear()
+    clear_monthly_report_cache()
 
 
 def save_reservation_sale(res_id, store, date_str, time_slot, amount):
@@ -710,6 +722,7 @@ def save_reservation_sale(res_id, store, date_str, time_slot, amount):
   df = pd.concat([df, new_row], ignore_index=True)
   conn.update(worksheet="reservation_sales", data=df)
   load_reservation_sales.clear()
+  clear_monthly_report_cache()
 
 
 def update_reservation_sale(sale_id, date_str, time_slot, amount):
@@ -721,6 +734,7 @@ def update_reservation_sale(sale_id, date_str, time_slot, amount):
     df.at[idx[0], "amount"] = amount
     conn.update(worksheet="reservation_sales", data=df)
     load_reservation_sales.clear()
+    clear_monthly_report_cache()
 
 
 def delete_reservation_sale(sale_id):
@@ -728,6 +742,7 @@ def delete_reservation_sale(sale_id):
   df = df[df["id"] != sale_id]
   conn.update(worksheet="reservation_sales", data=df)
   load_reservation_sales.clear()
+  clear_monthly_report_cache()
 
 
 # --- 表生成関数（過去月報の店頭売上・デリバリー売上反映に対応） ---
@@ -751,23 +766,30 @@ def generate_month_df(
     airregi_df,
 ):
   started_at = time.perf_counter()
-  result = _generate_month_df_cached(
-      selected_store,
-      year,
-      month,
-      target_slot_keyword,
-      bp_df,
-      deliv_df,
-      res_df,
-      res_sales_df,
-      airregi_df,
+  cache = st.session_state["monthly_report_cache"]
+  now = time.monotonic()
+  cache_key = (selected_store, year, month, target_slot_keyword)
+  cached_result = cache.get(cache_key)
+  if cached_result:
+    cached_at, result = cached_result
+    if now - cached_at < 45:
+      log_performance_time("月報データ生成（セッションキャッシュ）", started_at)
+      return result
+    del cache[cache_key]
+
+  result = _build_month_df(
+      selected_store, year, month, target_slot_keyword,
+      bp_df, deliv_df, res_df, res_sales_df, airregi_df,
   )
-  log_performance_time("月報データ生成（キャッシュ照合を含む）", started_at)
+  cache[cache_key] = (now, result)
+  while len(cache) > 12:
+    oldest_key = min(cache, key=lambda key: cache[key][0])
+    del cache[oldest_key]
+  log_performance_time("月報データ生成（再計算）", started_at)
   return result
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def _generate_month_df_cached(
+def _build_month_df(
     selected_store,
     year,
     month,
@@ -1755,6 +1777,7 @@ if APP_VARIANT in {"admin", "combined"}:
     load_reservations.clear()
     load_reservation_sales.clear()
     get_airregi_sheet_for_year.clear()
+    clear_monthly_report_cache()
     st.rerun()
 else:
   selected_year_month = datetime.now().strftime("%Y-%m")
