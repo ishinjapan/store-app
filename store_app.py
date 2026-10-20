@@ -545,7 +545,8 @@ def save_airregi_csv_to_sheets(
 
 def find_airregi_data_in_memory(date_str, df_year):
   if df_year is not None and not df_year.empty and "date" in df_year.columns:
-    sub = df_year[df_year["date"].astype(str).str.strip() == date_str.strip()]
+    date_keys = df_year["date"].map(normalize_date_key)
+    sub = df_year[date_keys == normalize_date_key(date_str)]
     if not sub.empty:
       sub_data = sub.drop(columns=["date"]).reset_index(drop=True)
       sub_data.columns = range(sub_data.shape[1])
@@ -1043,7 +1044,9 @@ def _build_month_df(
       ]
 
     for _, row in matched_air.iterrows():
-      d_key = str(row["date"]).strip()
+      d_key = normalize_date_key(row["date"])
+      if not d_key:
+        continue
       a_sales = parse_int(row[c_sales])
       a_cust = parse_int(row[c_cust])
       a_oth = (
