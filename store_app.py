@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -108,6 +109,19 @@ def normalize_date_key(val):
     return ""
   parsed = pd.to_datetime(val, errors="coerce")
   return parsed.strftime("%Y-%m-%d") if pd.notna(parsed) else ""
+
+
+def log_performance_time(label, started_at):
+  elapsed_ms = (time.perf_counter() - started_at) * 1000
+  print(f"[PERF] {label}: {elapsed_ms:.0f} ms")
+
+
+def timed_call(label, function, *args):
+  started_at = time.perf_counter()
+  try:
+    return function(*args)
+  finally:
+    log_performance_time(label, started_at)
 
 
 def estimate_delivery_count(delivery_sales):
@@ -719,8 +733,99 @@ def filter_rows_to_month(df, year, month):
   return df.loc[date_keys.str.startswith(month_prefix)]
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
+def filter_monthly_report_input(
+    df,
+    selected_store,
+    year,
+    month,
+    target_slot_keyword=None,
+    include_unspecified_slot=False,
+):
+  if df.empty:
+    return df
+  filtered = filter_rows_to_month(df, year, month)
+  if "store" in filtered.columns:
+    filtered = filtered[filtered["store"] == selected_store]
+  if target_slot_keyword and "time_slot" in filtered.columns:
+    slot_matches = filtered["time_slot"] == target_slot_keyword
+    if include_unspecified_slot:
+      slot_matches |= filtered["time_slot"] == "時間帯未指定"
+    filtered = filtered[slot_matches]
+  return filtered
+
+
+def filter_monthly_airregi_input(
+    df, selected_store, year, month, target_slot_keyword=None
+):
+  if df.empty or "date" not in df.columns:
+    return df
+  filtered = filter_rows_to_month(df, year, month)
+  if filtered.empty or len(filtered.columns) < 3:
+    return filtered
+
+  c_store = "c0" if "c0" in filtered.columns else filtered.columns[1]
+  c_slot = "c1" if "c1" in filtered.columns else filtered.columns[2]
+  short_key = get_short_store_key(selected_store)
+  filtered = filtered[
+      filtered[c_store].astype(str).str.contains(short_key, na=False)
+  ]
+  if target_slot_keyword is None:
+    return filtered[
+        filtered[c_slot].astype(str).str.strip() == "合計"
+    ]
+  return filtered[
+      filtered[c_slot]
+      .astype(str)
+      .str.contains(target_slot_keyword[0], na=False)
+  ]
+
+
 def generate_month_df(
+    selected_store,
+    year,
+    month,
+    target_slot_keyword,
+    bp_df,
+    deliv_df,
+    res_df,
+    res_sales_df,
+    airregi_df,
+):
+  started_at = time.perf_counter()
+  monthly_inputs = (
+      filter_monthly_report_input(
+          bp_df, selected_store, year, month, target_slot_keyword
+      ),
+      filter_monthly_report_input(
+          deliv_df, selected_store, year, month, target_slot_keyword
+      ),
+      filter_monthly_report_input(
+          res_df,
+          selected_store,
+          year,
+          month,
+          target_slot_keyword,
+          include_unspecified_slot=True,
+      ),
+      filter_monthly_report_input(
+          res_sales_df, selected_store, year, month, target_slot_keyword
+      ),
+      filter_monthly_airregi_input(
+          airregi_df, selected_store, year, month, target_slot_keyword
+      ),
+  )
+  log_performance_time("月報入力データの絞り込み", started_at)
+
+  started_at = time.perf_counter()
+  result = _generate_month_df_cached(
+      selected_store, year, month, target_slot_keyword, *monthly_inputs
+  )
+  log_performance_time("月報データ生成（キャッシュ照合を含む）", started_at)
+  return result
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def _generate_month_df_cached(
     selected_store,
     year,
     month,
@@ -1861,7 +1966,7 @@ year, month = map(int, selected_year_month.split("-"))
 
 # 共通データの取得
 try:
-  bp_df = load_budget_prev_data()
+  bp_df = timed_call("予算・前年データ読み込み", load_budget_prev_data)
 except RuntimeError as error:
   if APP_VARIANT in {"admin", "combined"}:
     st.error(f"月報の予算・前年データを読み込めません: {error}")
@@ -1900,11 +2005,11 @@ if APP_VARIANT in {"admin", "combined"}:
           "行が見つかりません。接続先のシートと日付・店舗名を確認してください。"
       )
 
-deliv_df = load_delivery_data()
-res_df = load_reservations()
-res_sales_df = load_reservation_sales()
+deliv_df = timed_call("デリバリーデータ読み込み", load_delivery_data)
+res_df = timed_call("予約データ読み込み", load_reservations)
+res_sales_df = timed_call("予約売上データ読み込み", load_reservation_sales)
 airregi_year_df = (
-    get_airregi_sheet_for_year(str(year))
+    timed_call("Airレジデータ読み込み", get_airregi_sheet_for_year, str(year))
     if APP_VARIANT in {"admin", "combined"}
     else pd.DataFrame()
 )
@@ -2953,8 +3058,13 @@ else:
     return html + "</tbody></table></div>"
 
   st.markdown(f"### 【{max_day}日時点 累計サマリー】")
+  render_started_at = time.perf_counter()
+  summary_html = render_styled_html_table(
+      pd.DataFrame(summary_data), is_summary=True
+  )
+  log_performance_time("月報サマリーHTML生成", render_started_at)
   st.markdown(
-      render_styled_html_table(pd.DataFrame(summary_data), is_summary=True),
+      summary_html,
       unsafe_allow_html=True,
   )
 
@@ -3031,7 +3141,7 @@ else:
         use_container_width=True,
     )
 
-  st.markdown(
-      render_styled_html_table(df_current_slot_formatted),
-      unsafe_allow_html=True,
-  )
+  render_started_at = time.perf_counter()
+  monthly_html = render_styled_html_table(df_current_slot_formatted)
+  log_performance_time("月報明細HTML生成", render_started_at)
+  st.markdown(monthly_html, unsafe_allow_html=True)
