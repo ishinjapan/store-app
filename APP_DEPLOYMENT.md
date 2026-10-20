@@ -7,6 +7,8 @@
 | 本部用 | `Honbu_app.py` | 店舗・年月を選択する月報一覧 |
 | 店舗用 | `store_input_app.py` | 店舗を選択する実績・予約入力と予約管理 |
 
+既存の `store_app.py` をMain file pathに指定したアプリは、従来どおり機能選択付きの統合画面として動作します。新規の本部用・店舗用アプリは、上記の専用起動ファイルを指定してください。
+
 ## 設定手順
 
 1. Streamlit Community Cloudでこのリポジトリ・ブランチを選択し、本部用アプリを作成します。Main file pathは `Honbu_app.py` にします。

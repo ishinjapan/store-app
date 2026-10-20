@@ -13,12 +13,12 @@ import pandas as pd
 import streamlit as st
 from streamlit_gsheets import GSheetsConnection
 
-APP_VARIANT = os.environ.get("STORE_APP_VARIANT", "admin")
+APP_VARIANT = os.environ.get("STORE_APP_VARIANT", "combined")
 APP_MODE_BY_VARIANT = {
     "admin": "📊 本部用（月報一覧表示）",
     "store": "📱 店舗用（実績入力）",
 }
-if APP_VARIANT not in APP_MODE_BY_VARIANT:
+if APP_VARIANT not in {*APP_MODE_BY_VARIANT, "combined"}:
   raise ValueError(f"未対応のアプリ種別です: {APP_VARIANT}")
 
 # ページ設定
@@ -26,9 +26,13 @@ st.set_page_config(
     page_title=(
         "本部用 月報一覧"
         if APP_VARIANT == "admin"
-        else "店舗用 実績・予約入力"
+        else (
+            "店舗用 実績・予約入力"
+            if APP_VARIANT == "store"
+            else "売上月報管理システム"
+        )
     ),
-    page_icon="📊" if APP_VARIANT == "admin" else "📱",
+    page_icon="📱" if APP_VARIANT == "store" else "📊",
     layout="wide",
 )
 
@@ -1652,7 +1656,7 @@ st.sidebar.selectbox(
     key="selected_store",
 )
 
-if APP_VARIANT == "admin":
+if APP_VARIANT in {"admin", "combined"}:
   st.sidebar.markdown("対象年")
   col_prev, col_year, col_next = st.sidebar.columns([1, 2, 1])
   with col_prev:
@@ -1676,7 +1680,18 @@ if APP_VARIANT == "admin":
 else:
   selected_year_month = datetime.now().strftime("%Y-%m")
 
-app_mode = APP_MODE_BY_VARIANT[APP_VARIANT]
+if APP_VARIANT == "combined":
+  app_mode = st.sidebar.radio(
+      "機能を選択してください",
+      [
+          APP_MODE_BY_VARIANT["admin"],
+          APP_MODE_BY_VARIANT["store"],
+          "📋 エクセルコピペ用データ生成",
+          "📄 報告書作成",
+      ],
+  )
+else:
+  app_mode = APP_MODE_BY_VARIANT[APP_VARIANT]
 
 selected_store = st.session_state["selected_store"]
 year, month = map(int, selected_year_month.split("-"))
@@ -1688,7 +1703,7 @@ res_df = load_reservations()
 res_sales_df = load_reservation_sales()
 airregi_year_df = (
     get_airregi_sheet_for_year(str(year))
-    if APP_VARIANT == "admin"
+    if APP_VARIANT in {"admin", "combined"}
     else pd.DataFrame()
 )
 
