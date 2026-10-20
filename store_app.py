@@ -293,23 +293,11 @@ def load_budget_prev_data():
   try:
     df = conn.read(worksheet="budget_prev", ttl=0).dropna(how="all")
     return deduplicate_budget_prev_data(df)
-  except Exception:
-    return pd.DataFrame(
-        columns=[
-            "date",
-            "store",
-            "time_slot",
-            "budget_sales",
-            "prev_sales",
-            "prev_cust",
-            "budget_cust",
-            "store_sales",
-            "delivery_sales",
-            "actual_cust",
-            "delivery_count",
-            "delivery_unit_price",
-        ]
-    )
+  except Exception as error:
+    raise RuntimeError(
+        "budget_prevシートを読み込めません。Google Sheets接続先と"
+        "サービスアカウントの共有権限を確認してください。"
+    ) from error
 
 
 @st.cache_data(ttl=600)
@@ -560,7 +548,10 @@ def get_available_months():
   display_year = st.session_state.get("display_year", str(datetime.now().year))
 
   # 1. budget_prev から過去月を自動取得（2026年9月以前に対応）
-  bp_df_all = load_budget_prev_data()
+  try:
+    bp_df_all = load_budget_prev_data()
+  except RuntimeError:
+    bp_df_all = pd.DataFrame()
   if not bp_df_all.empty and "date" in bp_df_all.columns:
     for d in bp_df_all["date"].dropna().astype(str):
       m = re.search(r"(\d{4})-(\d{2})", d)
@@ -1828,7 +1819,46 @@ selected_store = st.session_state["selected_store"]
 year, month = map(int, selected_year_month.split("-"))
 
 # 共通データの取得
-bp_df = load_budget_prev_data()
+try:
+  bp_df = load_budget_prev_data()
+except RuntimeError as error:
+  if APP_VARIANT in {"admin", "combined"}:
+    st.error(f"月報の予算・前年データを読み込めません: {error}")
+    st.stop()
+  st.warning(f"予算・前年データは利用できません: {error}")
+  bp_df = pd.DataFrame()
+
+if APP_VARIANT in {"admin", "combined"}:
+  if bp_df.empty:
+    st.warning(
+        "budget_prevシートにデータがありません。"
+        "本部用アプリのSecretsに、予算・前年データがあるGoogleスプレッドシートの"
+        "接続設定が登録されているか確認してください。"
+    )
+  elif not {
+      "date",
+      "store",
+      "time_slot",
+      "budget_sales",
+      "prev_sales",
+  }.issubset(bp_df.columns):
+    st.warning(
+        "budget_prevシートの列名が想定と異なります。"
+        "date、store、time_slot、budget_sales、prev_sales列を確認してください。"
+    )
+  elif {"date", "store"}.issubset(bp_df.columns):
+    matching_budget_rows = bp_df[
+        (bp_df["store"].astype(str).str.strip() == selected_store)
+        & bp_df["date"]
+        .apply(normalize_date_key)
+        .str.startswith(f"{year:04d}-{month:02d}")
+    ]
+    if matching_budget_rows.empty:
+      st.warning(
+          f"budget_prevシートに{selected_store}の{year}年{month}月の"
+          "行が見つかりません。接続先のシートと日付・店舗名を確認してください。"
+      )
+
 deliv_df = load_delivery_data()
 res_df = load_reservations()
 res_sales_df = load_reservation_sales()
