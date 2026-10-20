@@ -36,6 +36,8 @@ st.set_page_config(
     page_icon="📱" if APP_VARIANT == "store" else "📊",
     layout="wide",
 )
+st.session_state["performance_timings"] = []
+APP_RUN_STARTED_AT = time.perf_counter()
 
 # スプレッドシートとの接続
 conn = st.connection("gsheets", type=GSheetsConnection)
@@ -114,6 +116,10 @@ def normalize_date_key(val):
 def log_performance_time(label, started_at):
   elapsed_ms = (time.perf_counter() - started_at) * 1000
   print(f"[PERF] {label}: {elapsed_ms:.0f} ms")
+  st.session_state.setdefault("performance_timings", []).append({
+      "処理": label,
+      "時間（秒）": round(elapsed_ms / 1000, 3),
+  })
 
 
 def timed_call(label, function, *args):
@@ -3119,7 +3125,9 @@ else:
   with col_title:
     st.markdown("### 📅 日別実績一覧")
   with col_btn:
-    excel_data = create_multi_sheet_excel(
+    excel_data = timed_call(
+        "Excelデータ作成",
+        create_multi_sheet_excel,
         selected_store,
         year,
         month,
@@ -3145,3 +3153,10 @@ else:
   monthly_html = render_styled_html_table(df_current_slot_formatted)
   log_performance_time("月報明細HTML生成", render_started_at)
   st.markdown(monthly_html, unsafe_allow_html=True)
+  log_performance_time("月報画面全体", APP_RUN_STARTED_AT)
+  with st.expander("⏱ 月報の処理時間（今回の表示）"):
+    st.dataframe(
+        pd.DataFrame(st.session_state["performance_timings"]),
+        hide_index=True,
+        use_container_width=True,
+    )
