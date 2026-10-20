@@ -711,6 +711,15 @@ def delete_reservation_sale(sale_id):
 
 
 # --- 表生成関数（過去月報の店頭売上・デリバリー売上反映に対応） ---
+def filter_rows_to_month(df, year, month):
+  if df.empty or "date" not in df.columns:
+    return df
+  month_prefix = f"{year:04d}-{month:02d}"
+  date_keys = df["date"].map(normalize_date_key)
+  return df.loc[date_keys.str.startswith(month_prefix)]
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
 def generate_month_df(
     selected_store,
     year,
@@ -728,11 +737,15 @@ def generate_month_df(
   bp_dict = {}
   if not bp_df.empty:
     bp_sub = bp_df[bp_df["store"] == selected_store]
-    if target_slot_keyword and not bp_sub.empty:
-      bp_sub = bp_sub[bp_sub["time_slot"] == target_slot_keyword]
     if not bp_sub.empty:
       bp_sub = bp_sub.copy()
       bp_sub["_date_key"] = bp_sub["date"].apply(normalize_date_key)
+      bp_sub = bp_sub[bp_sub["_date_key"].str.startswith(
+          f"{year:04d}-{month:02d}"
+      )]
+    if target_slot_keyword and not bp_sub.empty:
+      bp_sub = bp_sub[bp_sub["time_slot"] == target_slot_keyword]
+    if not bp_sub.empty:
       bp_sub = bp_sub[bp_sub["_date_key"] != ""]
 
       b_cust_col = None
@@ -825,7 +838,9 @@ def generate_month_df(
   # 2. デリバリー売上の事前辞書化
   deliv_dict = {}
   if not deliv_df.empty:
-    d_sub = deliv_df[deliv_df["store"] == selected_store]
+    d_sub = filter_rows_to_month(
+        deliv_df[deliv_df["store"] == selected_store], year, month
+    )
     if target_slot_keyword and not d_sub.empty:
       d_sub = d_sub[d_sub["time_slot"] == target_slot_keyword]
     if not d_sub.empty:
@@ -876,7 +891,9 @@ def generate_month_df(
   # 3. 予約金の事前辞書化
   res_dict = {}
   if not res_df.empty:
-    r_sub = res_df[res_df["store"] == selected_store]
+    r_sub = filter_rows_to_month(
+        res_df[res_df["store"] == selected_store], year, month
+    )
     if target_slot_keyword and not r_sub.empty:
       r_sub = r_sub[
           (r_sub["time_slot"] == target_slot_keyword)
@@ -893,7 +910,9 @@ def generate_month_df(
   # 4. 売上計上の事前辞書化
   res_sales_dict = {}
   if not res_sales_df.empty:
-    rs_sub = res_sales_df[res_sales_df["store"] == selected_store]
+    rs_sub = filter_rows_to_month(
+        res_sales_df[res_sales_df["store"] == selected_store], year, month
+    )
     if target_slot_keyword and not rs_sub.empty:
       rs_sub = rs_sub[rs_sub["time_slot"] == target_slot_keyword]
     if not rs_sub.empty:
@@ -911,21 +930,32 @@ def generate_month_df(
       and not airregi_df.empty
       and "date" in airregi_df.columns
   ):
+    airregi_month_df = filter_rows_to_month(airregi_df, year, month)
     short_key = get_short_store_key(selected_store)
-    c_store = "c0" if "c0" in airregi_df.columns else airregi_df.columns[1]
-    c_slot = "c1" if "c1" in airregi_df.columns else airregi_df.columns[2]
-    c_sales = "c2" if "c2" in airregi_df.columns else airregi_df.columns[3]
-    c_cust = "c5" if "c5" in airregi_df.columns else airregi_df.columns[6]
+    c_store = (
+        "c0" if "c0" in airregi_month_df.columns else airregi_month_df.columns[1]
+    )
+    c_slot = (
+        "c1" if "c1" in airregi_month_df.columns else airregi_month_df.columns[2]
+    )
+    c_sales = (
+        "c2" if "c2" in airregi_month_df.columns else airregi_month_df.columns[3]
+    )
+    c_cust = (
+        "c5" if "c5" in airregi_month_df.columns else airregi_month_df.columns[6]
+    )
     c_other = (
         "c11"
-        if "c11" in airregi_df.columns
+        if "c11" in airregi_month_df.columns
         else (
-            airregi_df.columns[12] if len(airregi_df.columns) > 12 else None
+            airregi_month_df.columns[12]
+            if len(airregi_month_df.columns) > 12
+            else None
         )
     )
 
-    store_air = airregi_df[
-        airregi_df[c_store].astype(str).str.contains(short_key, na=False)
+    store_air = airregi_month_df[
+        airregi_month_df[c_store].astype(str).str.contains(short_key, na=False)
     ]
     if target_slot_keyword is None:
       matched_air = store_air[
