@@ -739,53 +739,6 @@ def filter_rows_to_month(df, year, month):
   return df.loc[date_keys.str.startswith(month_prefix)]
 
 
-def filter_monthly_report_input(
-    df,
-    selected_store,
-    year,
-    month,
-    target_slot_keyword=None,
-    include_unspecified_slot=False,
-):
-  if df.empty:
-    return df
-  filtered = filter_rows_to_month(df, year, month)
-  if "store" in filtered.columns:
-    filtered = filtered[filtered["store"] == selected_store]
-  if target_slot_keyword and "time_slot" in filtered.columns:
-    slot_matches = filtered["time_slot"] == target_slot_keyword
-    if include_unspecified_slot:
-      slot_matches |= filtered["time_slot"] == "時間帯未指定"
-    filtered = filtered[slot_matches]
-  return filtered
-
-
-def filter_monthly_airregi_input(
-    df, selected_store, year, month, target_slot_keyword=None
-):
-  if df.empty or "date" not in df.columns:
-    return df
-  filtered = filter_rows_to_month(df, year, month)
-  if filtered.empty or len(filtered.columns) < 3:
-    return filtered
-
-  c_store = "c0" if "c0" in filtered.columns else filtered.columns[1]
-  c_slot = "c1" if "c1" in filtered.columns else filtered.columns[2]
-  short_key = get_short_store_key(selected_store)
-  filtered = filtered[
-      filtered[c_store].astype(str).str.contains(short_key, na=False)
-  ]
-  if target_slot_keyword is None:
-    return filtered[
-        filtered[c_slot].astype(str).str.strip() == "合計"
-    ]
-  return filtered[
-      filtered[c_slot]
-      .astype(str)
-      .str.contains(target_slot_keyword[0], na=False)
-  ]
-
-
 def generate_month_df(
     selected_store,
     year,
@@ -798,33 +751,16 @@ def generate_month_df(
     airregi_df,
 ):
   started_at = time.perf_counter()
-  monthly_inputs = (
-      filter_monthly_report_input(
-          bp_df, selected_store, year, month, target_slot_keyword
-      ),
-      filter_monthly_report_input(
-          deliv_df, selected_store, year, month, target_slot_keyword
-      ),
-      filter_monthly_report_input(
-          res_df,
-          selected_store,
-          year,
-          month,
-          target_slot_keyword,
-          include_unspecified_slot=True,
-      ),
-      filter_monthly_report_input(
-          res_sales_df, selected_store, year, month, target_slot_keyword
-      ),
-      filter_monthly_airregi_input(
-          airregi_df, selected_store, year, month, target_slot_keyword
-      ),
-  )
-  log_performance_time("月報入力データの絞り込み", started_at)
-
-  started_at = time.perf_counter()
   result = _generate_month_df_cached(
-      selected_store, year, month, target_slot_keyword, *monthly_inputs
+      selected_store,
+      year,
+      month,
+      target_slot_keyword,
+      bp_df,
+      deliv_df,
+      res_df,
+      res_sales_df,
+      airregi_df,
   )
   log_performance_time("月報データ生成（キャッシュ照合を含む）", started_at)
   return result
@@ -3125,22 +3061,19 @@ else:
   with col_title:
     st.markdown("### 📅 日別実績一覧")
   with col_btn:
-    excel_data = timed_call(
-        "Excelデータ作成",
-        create_multi_sheet_excel,
-        selected_store,
-        year,
-        month,
-        bp_df,
-        deliv_df,
-        res_df,
-        res_sales_df,
-        airregi_year_df,
-    )
     st.markdown("<div style='padding-top: 10px;'></div>", unsafe_allow_html=True)
     st.download_button(
         label="📥 Excelダウンロード",
-        data=excel_data,
+        data=lambda: create_multi_sheet_excel(
+            selected_store,
+            year,
+            month,
+            bp_df,
+            deliv_df,
+            res_df,
+            res_sales_df,
+            airregi_year_df,
+        ),
         file_name=f"{selected_store}_{year}年{month}月度_売上月報.xlsx",
         mime=(
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
