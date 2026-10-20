@@ -203,16 +203,15 @@ def navigate_to_sales_page(page):
     sales_menu = page.get_by_text("売上・分析", exact=True).first
     sales_menu.wait_for(state="visible", timeout=15000)
     sales_menu.click()
-    page.wait_for_timeout(1000)
+    page.wait_for_timeout(1500)
     close_all_popups(page)
 
-    daily_sales_link = page.locator(
-        "a, button, [role='menuitem']"
-    ).filter(has_text="日別売上").first
-    daily_sales_link.wait_for(state="visible", timeout=15000)
-    daily_sales_link.click()
-    page.wait_for_load_state("domcontentloaded")
-    page.wait_for_timeout(1000)
+    daily_sales_menu = page.locator("text='日別売上'").first
+    daily_sales_menu.wait_for(state="visible", timeout=15000)
+    daily_sales_menu.click()
+    page.locator("h1.title").filter(has_text="日別売上").wait_for(
+        state="visible", timeout=15000
+    )
     close_all_popups(page)
 
 def extract_sales_for_date(page, target_date):
