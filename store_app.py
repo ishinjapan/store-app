@@ -430,14 +430,21 @@ def load_reservation_sales():
 @st.cache_data(ttl=60)
 def get_airregi_sheet_for_year(year_str):
   if not AIRREGI_SPREADSHEET_URL:
-    return pd.DataFrame()
+    raise RuntimeError(
+        "AIRREGI_SPREADSHEET が設定されていません。"
+        "本部アプリのSecretsで、Airレジ年別シートの接続先を確認してください。"
+    )
   try:
     df = conn.read(
         spreadsheet=AIRREGI_SPREADSHEET_URL, worksheet=str(year_str), ttl=0
     ).dropna(how="all")
     return df if not df.empty else pd.DataFrame()
-  except Exception:
-    return pd.DataFrame()
+  except Exception as error:
+    raise RuntimeError(
+        f"Airレジの{year_str}年シートを読み込めません。"
+        "本部アプリのAIRREGI_SPREADSHEET設定、シート名、"
+        "サービスアカウントの共有権限を確認してください。"
+    ) from error
 
 
 def save_airregi_csv_to_sheets(
@@ -588,7 +595,10 @@ def get_available_months():
         months.add(f"{m.group(1)}-{m.group(2)}")
 
   # 2. Airレジシートから取得
-  df_cur_year = get_airregi_sheet_for_year(display_year)
+  try:
+    df_cur_year = get_airregi_sheet_for_year(display_year)
+  except RuntimeError:
+    df_cur_year = pd.DataFrame()
   if not df_cur_year.empty and "date" in df_cur_year.columns:
     for d in df_cur_year["date"].dropna().astype(str):
       m = re.search(r"(\d{4})-(\d{2})", d)
@@ -754,6 +764,43 @@ def filter_rows_to_month(df, year, month):
   month_prefix = f"{year:04d}-{month:02d}"
   date_keys = df["date"].map(normalize_date_key)
   return df.loc[date_keys.str.startswith(month_prefix)]
+
+
+def build_airregi_match_diagnostics(df, selected_store, year, month):
+  columns = ["日付", "店舗行数", "合計行数", "合計行の店頭売上"]
+  if df.empty or "date" not in df.columns or len(df.columns) < 3:
+    return pd.DataFrame(columns=columns)
+
+  c_store = "c0" if "c0" in df.columns else df.columns[1]
+  c_slot = "c1" if "c1" in df.columns else df.columns[2]
+  c_sales = "c2" if "c2" in df.columns else df.columns[3]
+  short_key = get_short_store_key(selected_store)
+  date_keys = df["date"].map(normalize_date_key)
+  month_prefix = f"{year:04d}-{month:02d}"
+  month_rows = df.loc[date_keys.str.startswith(month_prefix)].copy()
+  month_rows["_date_key"] = date_keys.loc[month_rows.index]
+  store_rows = month_rows[
+      month_rows[c_store].astype(str).str.contains(short_key, na=False)
+  ]
+
+  diagnostics = []
+  _, days_in_month = calendar.monthrange(year, month)
+  for day in range(1, days_in_month + 1):
+    date_key = f"{year:04d}-{month:02d}-{day:02d}"
+    day_rows = store_rows[store_rows["_date_key"] == date_key]
+    total_rows = day_rows[
+        day_rows[c_slot].astype(str).str.strip() == "合計"
+    ]
+    sales_values = [
+        f"{parse_int(value):,}" for value in total_rows[c_sales].tolist()
+    ]
+    diagnostics.append({
+        "日付": date_key,
+        "店舗行数": len(day_rows),
+        "合計行数": len(total_rows),
+        "合計行の店頭売上": ", ".join(sales_values) if sales_values else "-",
+    })
+  return pd.DataFrame(diagnostics, columns=columns)
 
 
 def generate_month_df(
@@ -1982,11 +2029,43 @@ if APP_VARIANT in {"admin", "combined"}:
 deliv_df = timed_call("デリバリーデータ読み込み", load_delivery_data)
 res_df = timed_call("予約データ読み込み", load_reservations)
 res_sales_df = timed_call("予約売上データ読み込み", load_reservation_sales)
-airregi_year_df = (
-    timed_call("Airレジデータ読み込み", get_airregi_sheet_for_year, str(year))
-    if APP_VARIANT in {"admin", "combined"}
-    else pd.DataFrame()
+needs_monthly_report_data = (
+    APP_VARIANT == "admin"
+    or app_mode == APP_MODE_BY_VARIANT["admin"]
 )
+airregi_year_df = pd.DataFrame()
+if APP_VARIANT in {"admin", "combined"}:
+  try:
+    airregi_year_df = timed_call(
+        "Airレジデータ読み込み", get_airregi_sheet_for_year, str(year)
+    )
+  except RuntimeError as error:
+    if needs_monthly_report_data:
+      st.error(f"本部月報のAirレジデータを読み込めません: {error}")
+      st.stop()
+    st.warning(f"Airレジデータを読み込めません: {error}")
+
+if needs_monthly_report_data:
+  if airregi_year_df.empty:
+    st.warning(
+        f"Airレジの{year}年シートにデータがありません。"
+        "本部アプリのSecretsに設定したAIRREGI_SPREADSHEETが、"
+        "店舗アプリと同じスプレッドシートを指しているか確認してください。"
+    )
+  elif {"date", "c0"}.issubset(airregi_year_df.columns):
+    month_prefix = f"{year:04d}-{month:02d}"
+    month_date_keys = airregi_year_df["date"].map(normalize_date_key)
+    month_rows = airregi_year_df[month_date_keys.str.startswith(month_prefix)]
+    short_store_key = get_short_store_key(selected_store)
+    store_month_rows = month_rows[
+        month_rows["c0"].astype(str).str.contains(short_store_key, na=False)
+    ]
+    if store_month_rows.empty:
+      st.warning(
+          f"Airレジの{year}年シートに{selected_store}の{month}月データがありません。"
+          "Airレジ年別シートの同期状況と、本部アプリの"
+          "AIRREGI_SPREADSHEET設定を確認してください。"
+      )
 log_performance_time("月報データ準備（読み込み・検証を含む）", monthly_data_setup_started_at)
 
 if app_mode == "📱 店舗用（実績入力）":
@@ -3130,3 +3209,16 @@ else:
         hide_index=True,
         use_container_width=True,
     )
+  if needs_monthly_report_data:
+    with st.expander("🔎 Airレジ年別シートの照合結果"):
+      st.caption(
+          "本部アプリが読み込んだAirレジ年別シートから、"
+          "選択店舗・月の店舗行と「合計」行を確認します。"
+      )
+      st.dataframe(
+          build_airregi_match_diagnostics(
+              airregi_year_df, selected_store, year, month
+          ),
+          hide_index=True,
+          use_container_width=True,
+      )
