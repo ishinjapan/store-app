@@ -64,6 +64,14 @@ elif APP_VARIANT == "admin":
               flex: none !important;
           }
       }
+      </style>
+      """,
+      unsafe_allow_html=True,
+  )
+if APP_VARIANT in {"admin", "store"}:
+  st.markdown(
+      """
+      <style>
       [data-testid="manage-app-button"],
       [data-testid="stAppDeployButton"],
       .stAppDeployButton,
