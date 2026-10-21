@@ -36,7 +36,7 @@ st.set_page_config(
     page_icon="📱" if APP_VARIANT == "store" else "📊",
     layout="wide",
 )
-if APP_VARIANT in {"admin", "store"}:
+if APP_VARIANT == "store":
   st.markdown(
       """
       <style>
@@ -1810,7 +1810,7 @@ def show_airregi_extraction_error(error):
     st.image("error_screenshot.png", caption="エラー発生時のブラウザ画面")
 
 
-if APP_VARIANT == "combined":
+if APP_VARIANT in {"admin", "combined"}:
   st.sidebar.title("メニュー")
   st.sidebar.markdown("---")
   st.sidebar.subheader("店舗・期間設定")
@@ -1822,59 +1822,27 @@ if APP_VARIANT in {"admin", "combined"}:
   months_in_year = [
       m for m in available_months if m.startswith(display_year)
   ] or [f"{display_year}-10", f"{display_year}-01"]
-  if APP_VARIANT == "combined":
-    st.sidebar.markdown("対象年")
-    col_prev, col_year, col_next = st.sidebar.columns([1, 2, 1])
-    with col_prev:
-      st.button("◀", key="prev_year", on_click=prev_year_action)
-    with col_year:
-      st.markdown(
-          f"<div style='text-align: center; padding-top: 5px; font-weight: bold;"
-          f" font-size: 18px;'>{display_year}年</div>",
-          unsafe_allow_html=True,
-      )
-    with col_next:
-      st.button("▶", key="next_year", on_click=next_year_action)
-    st.sidebar.selectbox("対象月", months_in_year, key="selected_year_month")
-  elif st.session_state.get("selected_year_month") not in months_in_year:
-    st.session_state["selected_year_month"] = months_in_year[0]
-  if APP_VARIANT == "admin":
-    st.title("📊 売上月報一覧")
-    store_controls, period_controls = st.columns([1, 1])
-    with store_controls:
-      st.selectbox("閲覧店舗", STORES, key="selected_store")
-    with period_controls:
-      st.markdown("対象年")
-      year_prev, year_label, year_next = st.columns([1, 2, 1])
-      with year_prev:
-        st.button("◀", key="prev_year", on_click=prev_year_action)
-      with year_label:
-        st.markdown(
-            f"<div style='text-align: center; padding-top: 5px; "
-            f"font-weight: bold;'>{display_year}年</div>",
-            unsafe_allow_html=True,
-        )
-      with year_next:
-        st.button("▶", key="next_year", on_click=next_year_action)
-      st.selectbox("対象月", months_in_year, key="selected_year_month")
-      if st.button(
-          "🔄 最新データを再読み込み",
-          key="refresh_monthly_report_data_admin",
-          help="店舗アプリで登録したデータを含め、スプレッドシートから最新情報を読み込みます。",
-      ):
-        refresh_monthly_report_data()
-        st.rerun()
-
-  if APP_VARIANT == "combined":
-    refresh_monthly_report = st.sidebar.button(
-        "🔄 最新データを再読み込み",
-        key="refresh_monthly_report_data",
-        help="店舗アプリで登録したデータを含め、スプレッドシートから最新情報を読み込みます。",
+  st.sidebar.markdown("対象年")
+  col_prev, col_year, col_next = st.sidebar.columns([1, 2, 1])
+  with col_prev:
+    st.button("◀", key="prev_year", on_click=prev_year_action)
+  with col_year:
+    st.markdown(
+        f"<div style='text-align: center; padding-top: 5px; font-weight: bold;"
+        f" font-size: 18px;'>{display_year}年</div>",
+        unsafe_allow_html=True,
     )
-  else:
-    refresh_monthly_report = False
+  with col_next:
+    st.button("▶", key="next_year", on_click=next_year_action)
+  if st.session_state.get("selected_year_month") not in months_in_year:
+    st.session_state["selected_year_month"] = months_in_year[0]
+  st.sidebar.selectbox("対象月", months_in_year, key="selected_year_month")
 
-  if refresh_monthly_report:
+  if st.sidebar.button(
+      "🔄 最新データを再読み込み",
+      key="refresh_monthly_report_data",
+      help="店舗アプリで登録したデータを含め、スプレッドシートから最新情報を読み込みます。",
+  ):
     refresh_monthly_report_data()
     st.rerun()
 
@@ -2970,12 +2938,10 @@ elif app_mode == "📄 報告書作成":
     st.code("\n".join(report_lines).strip(), language="text")
 
 else:
-  if APP_VARIANT != "admin":
-    st.title("📊 売上月報一覧")
+  st.title("📊 売上月報一覧")
   selected_year_month = st.session_state["selected_year_month"]
   year, month = map(int, selected_year_month.split("-"))
-  if APP_VARIANT != "admin":
-    st.subheader(f"🏬 {selected_store} {year}年{month}月度")
+  st.subheader(f"🏬 {selected_store} {year}年{month}月度")
   st.markdown("---")
 
   def format_currency(val):
