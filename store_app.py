@@ -122,6 +122,7 @@ STORE_CREDENTIALS = {
 STORES = list(STORE_CREDENTIALS.keys())
 TIME_SLOTS = ["早番", "中番", "遅番"]
 DELIVERY_UNIT_PRICE = 1800
+AIRREGI_REPORT_START_DATE = "2026-10-01"
 
 
 def normalize_time_slot(val):
@@ -1163,7 +1164,7 @@ def _build_month_df(
     b_cust = bp_item.get("budget_cust", 0)
 
     # 過去データ判定（2026年9月以前は過去月報の数値を優先反映）
-    is_past_archive = date_str < "2026-10-01"
+    is_past_archive = date_str < AIRREGI_REPORT_START_DATE
 
     air_sales, air_cust, air_other_sales = 0, 0, 0
     if date_str in air_dict:
@@ -2079,19 +2080,22 @@ needs_monthly_report_data = (
     APP_VARIANT == "admin"
     or app_mode == APP_MODE_BY_VARIANT["admin"]
 )
+uses_airregi_monthly_data = (
+    f"{year:04d}-{month:02d}-01" >= AIRREGI_REPORT_START_DATE
+)
 airregi_year_df = pd.DataFrame()
-if APP_VARIANT in {"admin", "combined"}:
+if APP_VARIANT in {"admin", "combined"} and uses_airregi_monthly_data:
   try:
     airregi_year_df = timed_call(
         "Airレジデータ読み込み", get_airregi_sheet_for_year, str(year)
     )
   except RuntimeError as error:
-    if needs_monthly_report_data:
+    if needs_monthly_report_data and uses_airregi_monthly_data:
       st.error(f"本部月報のAirレジデータを読み込めません: {error}")
       st.stop()
     st.warning(f"Airレジデータを読み込めません: {error}")
 
-if needs_monthly_report_data:
+if needs_monthly_report_data and uses_airregi_monthly_data:
   if airregi_year_df.empty:
     st.warning(
         f"Airレジの{year}年シートにデータがありません。"
