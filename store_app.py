@@ -483,7 +483,7 @@ def load_reservation_sales():
     )
 
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=60, show_spinner=APP_VARIANT != "admin")
 def get_airregi_sheet_for_year(year_str):
   if not AIRREGI_SPREADSHEET_URL:
     raise RuntimeError(
