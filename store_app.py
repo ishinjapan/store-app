@@ -36,6 +36,17 @@ st.set_page_config(
     page_icon="📱" if APP_VARIANT == "store" else "📊",
     layout="wide",
 )
+if APP_VARIANT in {"admin", "store"}:
+  st.markdown(
+      """
+      <style>
+      section[data-testid="stSidebar"], [data-testid="collapsedControl"] {
+          display: none !important;
+      }
+      </style>
+      """,
+      unsafe_allow_html=True,
+  )
 st.session_state["performance_timings"] = []
 st.session_state.setdefault("monthly_report_cache", {})
 APP_RUN_STARTED_AT = time.perf_counter()
@@ -125,6 +136,15 @@ def log_performance_time(label, started_at):
 
 def clear_monthly_report_cache():
   st.session_state["monthly_report_cache"] = {}
+
+
+def refresh_monthly_report_data():
+  load_budget_prev_data.clear()
+  load_delivery_data.clear()
+  load_reservations.clear()
+  load_reservation_sales.clear()
+  get_airregi_sheet_for_year.clear()
+  clear_monthly_report_cache()
 
 
 def timed_call(label, function, *args):
@@ -1790,50 +1810,51 @@ def show_airregi_extraction_error(error):
     st.image("error_screenshot.png", caption="エラー発生時のブラウザ画面")
 
 
-st.sidebar.title("メニュー")
-st.sidebar.markdown("---")
-st.sidebar.subheader(
-    "店舗設定" if APP_VARIANT == "store" else "店舗・期間設定"
-)
-st.sidebar.selectbox(
-    "入力店舗" if APP_VARIANT == "store" else "閲覧店舗",
-    STORES,
-    key="selected_store",
-)
+if APP_VARIANT == "combined":
+  st.sidebar.title("メニュー")
+  st.sidebar.markdown("---")
+  st.sidebar.subheader("店舗・期間設定")
+  st.sidebar.selectbox("閲覧店舗", STORES, key="selected_store")
 
 if APP_VARIANT in {"admin", "combined"}:
-  st.sidebar.markdown("対象年")
-  col_prev, col_year, col_next = st.sidebar.columns([1, 2, 1])
-  with col_prev:
-    st.button("◀", key="prev_year", on_click=prev_year_action)
-  with col_year:
-    st.markdown(
-        f"<div style='text-align: center; padding-top: 5px; font-weight: bold;"
-        f" font-size: 18px;'>{st.session_state['display_year']}年</div>",
-        unsafe_allow_html=True,
-    )
-  with col_next:
-    st.button("▶", key="next_year", on_click=next_year_action)
-
   display_year = st.session_state["display_year"]
   available_months = get_available_months()
   months_in_year = [
       m for m in available_months if m.startswith(display_year)
   ] or [f"{display_year}-10", f"{display_year}-01"]
-  st.sidebar.selectbox("対象月", months_in_year, key="selected_year_month")
-  selected_year_month = st.session_state["selected_year_month"]
-  if st.sidebar.button(
-      "🔄 最新データを再読み込み",
-      key="refresh_monthly_report_data",
-      help="店舗アプリで登録したデータを含め、スプレッドシートから最新情報を読み込みます。",
+  if APP_VARIANT == "combined":
+    st.sidebar.markdown("対象年")
+    col_prev, col_year, col_next = st.sidebar.columns([1, 2, 1])
+    with col_prev:
+      st.button("◀", key="prev_year", on_click=prev_year_action)
+    with col_year:
+      st.markdown(
+          f"<div style='text-align: center; padding-top: 5px; font-weight: bold;"
+          f" font-size: 18px;'>{display_year}年</div>",
+          unsafe_allow_html=True,
+      )
+    with col_next:
+      st.button("▶", key="next_year", on_click=next_year_action)
+    st.sidebar.selectbox("対象月", months_in_year, key="selected_year_month")
+  elif (
+      st.session_state.get("selected_year_month") not in months_in_year
   ):
-    load_budget_prev_data.clear()
-    load_delivery_data.clear()
-    load_reservations.clear()
-    load_reservation_sales.clear()
-    get_airregi_sheet_for_year.clear()
-    clear_monthly_report_cache()
+    st.session_state["selected_year_month"] = months_in_year[0]
+
+  if APP_VARIANT == "combined":
+    refresh_monthly_report = st.sidebar.button(
+        "🔄 最新データを再読み込み",
+        key="refresh_monthly_report_data",
+        help="店舗アプリで登録したデータを含め、スプレッドシートから最新情報を読み込みます。",
+    )
+  else:
+    refresh_monthly_report = False
+
+  if refresh_monthly_report:
+    refresh_monthly_report_data()
     st.rerun()
+
+  selected_year_month = st.session_state["selected_year_month"]
 else:
   selected_year_month = datetime.now().strftime("%Y-%m")
 
@@ -2093,9 +2114,8 @@ if app_mode == "📱 店舗用（実績入力）":
   )
 
   st.title("📱 実績・予約管理")
-  st.markdown(
-      f"現在選択中の店舗: **{selected_store}** （サイドバーで変更可能）"
-  )
+  st.selectbox("入力店舗", STORES, key="selected_store")
+  selected_store = st.session_state["selected_store"]
 
   tab_input, tab_manage = st.tabs(
       ["📝 日次入力 (デリバリー売上 / 予約)", "⚙️ 予約データの確認・修正・削除"]
@@ -2927,6 +2947,39 @@ elif app_mode == "📄 報告書作成":
 
 else:
   st.title("📊 売上月報一覧")
+  if APP_VARIANT == "admin":
+    (
+        period_col_prev,
+        period_col_year,
+        period_col_next,
+        period_col_month,
+        period_col_refresh,
+    ) = st.columns(
+        [1, 2, 1, 3, 2]
+    )
+    with period_col_prev:
+      st.button("◀", key="prev_year", on_click=prev_year_action)
+    with period_col_year:
+      st.markdown(
+          f"<div style='text-align: center; padding-top: 10px; font-weight: bold;"
+          f" font-size: 18px;'>{st.session_state['display_year']}年</div>",
+          unsafe_allow_html=True,
+      )
+    with period_col_next:
+      st.button("▶", key="next_year", on_click=next_year_action)
+    with period_col_month:
+      st.selectbox("対象月", months_in_year, key="selected_year_month")
+    with period_col_refresh:
+      if st.button(
+          "🔄 最新データを再読み込み",
+          key="refresh_monthly_report_data",
+          help="店舗アプリで登録したデータを含め、スプレッドシートから最新情報を読み込みます。",
+      ):
+        refresh_monthly_report_data()
+        st.rerun()
+
+  selected_year_month = st.session_state["selected_year_month"]
+  year, month = map(int, selected_year_month.split("-"))
   st.subheader(f"🏬 {selected_store} {year}年{month}月度")
   st.markdown("---")
 
@@ -3126,6 +3179,9 @@ else:
 
   st.markdown("---")
   st.markdown("### 🔍 表示する時間帯を選択してください")
+  if APP_VARIANT == "admin":
+    st.selectbox("閲覧店舗", STORES, key="selected_store")
+    selected_store = st.session_state["selected_store"]
 
   if "active_slot_tab" not in st.session_state:
     st.session_state["active_slot_tab"] = "合計"
