@@ -52,14 +52,16 @@ elif APP_VARIANT == "admin":
       """
       <style>
       @media (max-width: 640px) {
-          section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
-              flex-direction: row !important;
-              flex-wrap: nowrap !important;
+          .st-key-admin_year_navigation [data-testid="stHorizontalBlock"] {
+              display: grid !important;
+              grid-template-columns: minmax(44px, 1fr) minmax(60px, 2fr) minmax(44px, 1fr) !important;
+              align-items: center !important;
           }
-          section[data-testid="stSidebar"] [data-testid="column"] {
+          .st-key-admin_year_navigation [data-testid="column"] {
               min-width: 0 !important;
               width: auto !important;
-              flex: 1 1 0% !important;
+              max-width: none !important;
+              flex: none !important;
           }
       }
       [data-testid="manage-app-button"],
@@ -1848,7 +1850,12 @@ if APP_VARIANT in {"admin", "combined"}:
       m for m in available_months if m.startswith(display_year)
   ] or [f"{display_year}-10", f"{display_year}-01"]
   st.sidebar.markdown("対象年")
-  col_prev, col_year, col_next = st.sidebar.columns([1, 2, 1])
+  if APP_VARIANT == "admin":
+    with st.sidebar.container(key="admin_year_navigation"):
+      year_columns = st.columns([1, 2, 1], gap="small")
+  else:
+    year_columns = st.sidebar.columns([1, 2, 1])
+  col_prev, col_year, col_next = year_columns
   with col_prev:
     st.button("◀", key="prev_year", on_click=prev_year_action)
   with col_year:
