@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timedelta
 import pandas as pd
 from dotenv import load_dotenv
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 load_dotenv()
@@ -202,12 +203,43 @@ def navigate_to_sales_page(page):
 
     sales_menu = page.get_by_text("売上・分析", exact=True).first
     sales_menu.wait_for(state="visible", timeout=15000)
-    sales_menu.click()
-    page.wait_for_timeout(1500)
-    close_all_popups(page)
+    daily_sales_menu = page.get_by_text("日別売上", exact=False).first
+    if not daily_sales_menu.is_visible():
+        sales_menu.click()
+        page.wait_for_timeout(1000)
+        close_all_popups(page)
 
-    daily_sales_menu = page.locator("text='日別売上'").first
-    daily_sales_menu.wait_for(state="visible", timeout=15000)
+    try:
+        daily_sales_menu.wait_for(state="visible", timeout=5000)
+    except PlaywrightTimeoutError:
+        collapsed_menu = sales_menu.locator(
+            "xpath=ancestor::*[@aria-expanded='false'][1]"
+        )
+        if collapsed_menu.count():
+            collapsed_menu.click()
+
+    try:
+        daily_sales_menu.wait_for(state="visible", timeout=15000)
+    except PlaywrightTimeoutError as error:
+        navigation_items = page.locator(
+            "nav a, nav button, [role='menuitem']"
+        ).evaluate_all("""elements => elements
+            .filter(element => {
+                const rect = element.getBoundingClientRect();
+                const style = getComputedStyle(element);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.display !== 'none' && style.visibility !== 'hidden';
+            })
+            .map(element => element.innerText.trim())
+            .filter(Boolean)
+        """)
+        raise RuntimeError(
+            "Airレジの「日別売上」メニューを見つけられませんでした。"
+            f" 現在のURL: {page.url}"
+            f" 表示中のメニュー: {navigation_items}"
+        ) from error
+
+    close_all_popups(page)
     daily_sales_menu.click()
     daily_sales_heading.first.wait_for(state="visible", timeout=15000)
     close_all_popups(page)
