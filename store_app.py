@@ -47,6 +47,31 @@ if APP_VARIANT == "store":
       """,
       unsafe_allow_html=True,
   )
+elif APP_VARIANT == "admin":
+  st.markdown(
+      """
+      <style>
+      @media (max-width: 640px) {
+          section[data-testid="stSidebar"] [data-testid="stHorizontalBlock"] {
+              flex-direction: row !important;
+              flex-wrap: nowrap !important;
+          }
+          section[data-testid="stSidebar"] [data-testid="column"] {
+              min-width: 0 !important;
+              width: auto !important;
+              flex: 1 1 0% !important;
+          }
+      }
+      [data-testid="manage-app-button"],
+      [data-testid="stAppDeployButton"],
+      .stAppDeployButton,
+      button[aria-label="Manage app"] {
+          display: none !important;
+      }
+      </style>
+      """,
+      unsafe_allow_html=True,
+  )
 st.session_state["performance_timings"] = []
 st.session_state.setdefault("monthly_report_cache", {})
 APP_RUN_STARTED_AT = time.perf_counter()
@@ -1838,13 +1863,14 @@ if APP_VARIANT in {"admin", "combined"}:
     st.session_state["selected_year_month"] = months_in_year[0]
   st.sidebar.selectbox("対象月", months_in_year, key="selected_year_month")
 
-  if st.sidebar.button(
-      "🔄 最新データを再読み込み",
-      key="refresh_monthly_report_data",
-      help="店舗アプリで登録したデータを含め、スプレッドシートから最新情報を読み込みます。",
-  ):
-    refresh_monthly_report_data()
-    st.rerun()
+  if APP_VARIANT == "combined":
+    if st.sidebar.button(
+        "🔄 最新データを再読み込み",
+        key="refresh_monthly_report_data",
+        help="店舗アプリで登録したデータを含め、スプレッドシートから最新情報を読み込みます。",
+    ):
+      refresh_monthly_report_data()
+      st.rerun()
 
   selected_year_month = st.session_state["selected_year_month"]
 else:
@@ -3217,13 +3243,14 @@ else:
   log_performance_time("月報明細HTML生成", render_started_at)
   st.markdown(monthly_html, unsafe_allow_html=True)
   log_performance_time("月報画面全体", APP_RUN_STARTED_AT)
-  with st.expander("⏱ 月報の処理時間（今回の表示）"):
-    st.dataframe(
-        pd.DataFrame(st.session_state["performance_timings"]),
-        hide_index=True,
-        use_container_width=True,
-    )
-  if needs_monthly_report_data:
+  if APP_VARIANT != "admin":
+    with st.expander("⏱ 月報の処理時間（今回の表示）"):
+      st.dataframe(
+          pd.DataFrame(st.session_state["performance_timings"]),
+          hide_index=True,
+          use_container_width=True,
+      )
+  if needs_monthly_report_data and APP_VARIANT != "admin":
     with st.expander("🔎 Airレジ年別シートの照合結果"):
       st.caption(
           "本部アプリが読み込んだAirレジ年別シートから、"
